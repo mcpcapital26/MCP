@@ -1,20 +1,16 @@
 # acquisitions_alerts.py
-# Scrapes multiple “business for sale / acquisition” websites and sends ONLY new announcements via Telegram.
-# Remembers last seen announcements per website in a local JSON state file.
+# Scrapes acquisition/business-for-sale websites, sends ONLY new announcements via Telegram,
+# and enriches alerts by fetching EACH new item's detail page to extract characteristics.
 #
-# Install deps:
+# Deps:
 #   pip install requests beautifulsoup4 lxml
 #
-# Env vars (same pattern as your other bot):
-#   TELEGRAM_BOT_TOKEN=...
-#   TELEGRAM_CHAT_ID=...
+# Env:
+#   TELEGRAM_BOT_TOKEN
+#   TELEGRAM_CHAT_ID
 #
-# Run:
-#   python acquisitions_alerts.py
-#
-# Notes:
-# - This is a best-effort scraper. These sites can change HTML; when they do, update the CSS selectors below.
-# - commerce-a-remettre.be: will IGNORE announcements where "type" == "horeca" (case-insensitive).
+# State file (committed back to repo by workflow):
+#   seen_announcements_by_site.json
 
 import os
 import re
@@ -22,7 +18,7 @@ import json
 import time
 import hashlib
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Callable, Tuple
+from typing import List, Dict, Callable, Tuple
 from urllib.parse import urljoin
 
 import requests
@@ -31,11 +27,13 @@ from bs4 import BeautifulSoup
 
 USER_AGENT = "Mozilla/5.0 (AcquisitionAnnouncementsBot; +https://github.com/)"
 STATE_FILE = "seen_announcements_by_site.json"
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = 35
 SLEEP_BETWEEN_SITES_SEC = 1.0
+SLEEP_BETWEEN_DETAILS_SEC = 0.7
+MAX_NEW_PER_SITE_PER_RUN = 15  # cap to avoid spam / long runs
 
 # ----------------------------
-# Sites (as provided)
+# URLs (as provided)
 # ----------------------------
 URL_COFIM = "https://www.cofim.be/fr/entreprises/entreprises-fonds-de-commerce"
 URL_COMMERCE_A_REMETTRE = "https://www.commerce-a-remettre.be/recherche?region=&sector=&id="
@@ -67,22 +65,25 @@ class Announcement:
     site: str
     title: str
     url: str
-    meta: Dict[str, str]  # arbitrary fields, e.g. {"type": "...", "location": "...", "price": "..."}
+    meta: Dict[str, str]  # can include pre-parsed fields from listing page
 
     @property
     def key(self) -> str:
-        # Stable-ish unique key per announcement (prefer URL; fallback to hash(title+url)).
+        # Stable key: URL is usually unique. Include title to reduce collision on some sites.
         raw = (self.url or "") + "||" + (self.title or "")
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 # ----------------------------
-# Helpers
+# HTTP / parsing helpers
 # ----------------------------
 def http_get(url: str) -> str:
     r = requests.get(
         url,
-        headers={"User-Agent": USER_AGENT, "Accept-Language": "fr,en;q=0.8,nl;q=0.6"},
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "fr,en;q=0.8,nl;q=0.6",
+        },
         timeout=REQUEST_TIMEOUT,
     )
     r.raise_for_status()
@@ -112,7 +113,6 @@ def load_state() -> Dict[str, List[str]]:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, dict):
-                # ensure list values
                 return {k: list(v) for k, v in data.items()}
     except Exception:
         pass
@@ -130,194 +130,296 @@ def send_telegram(bot_token: str, chat_id: str, message: str) -> None:
         return
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message}
-    try:
-        rr = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        if not rr.ok:
-            print("Telegram send failed:", rr.text)
-    except Exception as e:
-        print("Telegram send exception:", e)
+    rr = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+    if not rr.ok:
+        print("Telegram send failed:", rr.text)
 
 
 # ----------------------------
-# Parsers (best-effort CSS selectors with fallbacks)
+# Generic field extraction from detail pages
+# ----------------------------
+def extract_kv_pairs(soup: BeautifulSoup) -> Dict[str, str]:
+    """
+    Best-effort extractor:
+      - <dl><dt>Label</dt><dd>Value</dd>
+      - tables: <tr><th/td>Label</th/td><td>Value</td></tr>
+      - 'Label: Value' patterns from text blocks
+    Returns raw label->value pairs.
+    """
+    kv: Dict[str, str] = {}
+
+    # 1) Definition lists
+    for dl in soup.select("dl"):
+        dts = dl.select("dt")
+        for dt in dts:
+            dd = dt.find_next_sibling("dd")
+            if not dd:
+                continue
+            k = first_text(dt)
+            v = first_text(dd)
+            if k and v and len(k) <= 80 and len(v) <= 400:
+                kv[k] = v
+
+    # 2) Tables (two columns)
+    for tr in soup.select("table tr"):
+        cells = tr.find_all(["th", "td"])
+        if len(cells) < 2:
+            continue
+        k = first_text(cells[0])
+        v = first_text(cells[1])
+        if k and v and len(k) <= 80 and len(v) <= 400:
+            kv[k] = v
+
+    # 3) Label-value patterns in text
+    text_blocks = []
+    for sel in ["main", "article", ".content", ".container", "body"]:
+        node = soup.select_one(sel)
+        if node:
+            text_blocks.append(first_text(node))
+            break
+    full_text = "\n".join([t for t in text_blocks if t])
+
+    # Match lines like "Type : Horeca" / "Secteur - Services"
+    for line in full_text.splitlines():
+        line = text_clean(line)
+        if not line or len(line) > 250:
+            continue
+        m = re.match(r"^([A-Za-zÀ-ÿ0-9 \/\-\(\)\.]{2,50})\s*[:\-]\s*(.{2,160})$", line)
+        if m:
+            k = text_clean(m.group(1))
+            v = text_clean(m.group(2))
+            if k and v:
+                # avoid trash values that are just punctuation
+                if re.fullmatch(r"[\-\:\.\/ ]+", v):
+                    continue
+                kv.setdefault(k, v)
+
+    return kv
+
+
+CANONICAL_KEYS = {
+    "type": [
+        "type", "categorie", "catégorie", "category", "activiteiten", "activiteit", "activité",
+        "branche", "branch", "soort"
+    ],
+    "sector": [
+        "secteur", "sector", "activité", "activiteiten", "branche", "industrie", "industry"
+    ],
+    "location": [
+        "lieu", "localisation", "ville", "city", "gemeente", "plaats", "région", "region",
+        "province", "plaatsnaam", "code postal", "postcode"
+    ],
+    "price": [
+        "prix", "price", "vraagprijs", "asking price", "overnameprijs", "cession", "prijs"
+    ],
+    "turnover": [
+        "chiffre d'affaires", "ca", "omzet", "turnover", "revenue"
+    ],
+    "ebitda": [
+        "ebitda", "résultat", "resultaat", "profit", "bénéfice", "marge"
+    ],
+    "employees": [
+        "employés", "employes", "employees", "personeel", "fte", "staff", "nombre d'employés"
+    ],
+    "reference": [
+        "référence", "reference", "ref", "code", "dossier", "nummer", "id"
+    ],
+    "date": [
+        "date", "publication", "publié", "posted", "geplaatst", "ajouté", "added"
+    ],
+}
+
+def canonicalize(kv: Dict[str, str]) -> Dict[str, str]:
+    """
+    Map raw label->value pairs into a canonical set, choosing the first best match per key.
+    """
+    out: Dict[str, str] = {}
+
+    for canon, needles in CANONICAL_KEYS.items():
+        for raw_k, raw_v in kv.items():
+            lk = raw_k.lower()
+            if any(n in lk for n in needles):
+                out.setdefault(canon, raw_v)
+
+    return out
+
+
+def extract_description(soup: BeautifulSoup) -> str:
+    """
+    Try to extract a short description snippet.
+    """
+    candidates = []
+    for sel in ["meta[name='description']", "meta[property='og:description']"]:
+        m = soup.select_one(sel)
+        if m and m.get("content"):
+            candidates.append(text_clean(m["content"]))
+
+    for sel in ["article p", "main p", ".description", "[class*='description'] p"]:
+        p = soup.select_one(sel)
+        if p:
+            candidates.append(first_text(p))
+
+    for c in candidates:
+        c = text_clean(c)
+        if c and len(c) >= 40:
+            return c[:280] + ("…" if len(c) > 280 else "")
+    return ""
+
+
+def enrich_from_detail(url: str) -> Dict[str, str]:
+    """
+    Fetch detail page, return canonicalized fields + description snippet.
+    """
+    html = http_get(url)
+    soup = soupify(html)
+    kv_raw = extract_kv_pairs(soup)
+    canon = canonicalize(kv_raw)
+    desc = extract_description(soup)
+    if desc:
+        canon["description"] = desc
+    return canon
+
+
+# ----------------------------
+# Listing parsers (best-effort)
 # ----------------------------
 def parse_cofim(html: str) -> List[Announcement]:
     base = "https://www.cofim.be"
     soup = soupify(html)
+    out: List[Announcement] = []
 
-    # Try common patterns: cards with links to company pages
-    links = soup.select("a[href]")
-    out = []
-    for a in links:
+    # Heuristic: links to individual company pages under /fr/entreprises/
+    for a in soup.select("a[href]"):
         href = a.get("href", "")
-        # heuristic: keep links under /fr/entreprises/ and not the listing page itself
         if "/fr/entreprises/" in href and "entreprises-fonds-de-commerce" not in href:
             title = first_text(a)
             if not title or len(title) < 5:
                 continue
-            url = absolute_url(base, href)
-            out.append(Announcement("cofim", title, url, {}))
+            out.append(Announcement("cofim", title, absolute_url(base, href), {}))
 
-    # De-duplicate by URL
     uniq = {}
     for x in out:
         uniq[x.url] = x
-    return list(uniq.values())[:100]
+    return list(uniq.values())[:200]
 
 
 def parse_commerce_a_remettre(html: str) -> List[Announcement]:
     base = "https://www.commerce-a-remettre.be"
     soup = soupify(html)
-
     out: List[Announcement] = []
 
-    # Typical result cards; fallback: any link that looks like an announcement/details page
+    # Look for result cards or blocks containing links
     cards = soup.select("[class*='result'], [class*='card'], article, .annonce, .listing")
     if not cards:
-        cards = soup.select("a[href*='annonce'], a[href*='detail'], a[href*='reprise'], a[href*='commerce']")
-        cards = [a.parent for a in cards if a.parent]
+        cards = [a.parent for a in soup.select("a[href]") if a.parent]
 
     for card in cards:
-        # find main link
         a = card.select_one("a[href]")
         if not a:
             continue
         href = a.get("href", "")
         url = absolute_url(base, href)
         title = first_text(a) or first_text(card.select_one("h2, h3, .title, [class*='title']"))
-
         if not title or len(title) < 5:
             continue
 
-        # find "type" field somewhere in the card (labelled "Type" or similar)
+        # Try to extract "type" from listing card text
+        meta = {}
         card_text = text_clean(card.get_text(" "))
-        type_val = ""
         m = re.search(r"\btype\b\s*[:\-]?\s*([A-Za-zÀ-ÿ0-9\/\s]+)", card_text, flags=re.I)
         if m:
-            type_val = text_clean(m.group(1))[:60]
-
-        # Exclude horeca
-        if type_val and type_val.lower().strip() == "horeca":
-            continue
-
-        meta = {}
-        if type_val:
-            meta["type"] = type_val
+            t = text_clean(m.group(1))[:60]
+            if t:
+                meta["type"] = t
 
         out.append(Announcement("commerce-a-remettre", title, url, meta))
 
-    # De-duplicate by URL
     uniq = {}
     for x in out:
         uniq[x.url] = x
-    return list(uniq.values())[:200]
+    return list(uniq.values())[:250]
 
 
 def parse_wallonie_entreprendre(html: str) -> List[Announcement]:
     base = "https://transmission.wallonie-entreprendre.be"
     soup = soupify(html)
+    out: List[Announcement] = []
 
-    out = []
-    # Try catalogue cards
-    cards = soup.select("a[href*='/annonce'], a[href*='/catalogue/'], article, [class*='card'], [class*='listing']")
-    for el in cards:
-        a = el if el.name == "a" else el.select_one("a[href]")
-        if not a:
-            continue
+    # Cards / links to catalogue items
+    for a in soup.select("a[href]"):
         href = a.get("href", "")
-        if "/catalogue" not in href and "/annonce" not in href and "/offre" not in href:
-            continue
-        url = absolute_url(base, href)
-        title = first_text(el.select_one("h2, h3, .title, [class*='title']")) or first_text(a)
-        if not title or len(title) < 5:
-            continue
-        out.append(Announcement("wallonie-entreprendre", title, url, {}))
+        if "/catalogue" in href or "/annonce" in href or "/offre" in href:
+            url = absolute_url(base, href)
+            title = first_text(a.select_one("h2, h3, .title, [class*='title']")) or first_text(a)
+            if title and len(title) >= 5:
+                out.append(Announcement("wallonie-entreprendre", title, url, {}))
 
     uniq = {}
     for x in out:
         uniq[x.url] = x
-    return list(uniq.values())[:200]
+    return list(uniq.values())[:250]
 
 
 def parse_overnamemarkt(html: str) -> List[Announcement]:
     base = "https://www.overnamemarkt.be"
     soup = soupify(html)
+    out: List[Announcement] = []
 
-    out = []
-    cards = soup.select("a[href*='/fr/acheter/'], a[href*='/acheter/'], article, [class*='card'], [class*='listing']")
-    for el in cards:
-        a = el if el.name == "a" else el.select_one("a[href]")
-        if not a:
-            continue
+    for a in soup.select("a[href]"):
         href = a.get("href", "")
-        if "/acheter" not in href:
-            continue
-        url = absolute_url(base, href)
-        title = first_text(el.select_one("h2, h3, .title, [class*='title']")) or first_text(a)
-        if not title or len(title) < 5:
-            continue
-        out.append(Announcement("overnamemarkt", title, url, {}))
+        if "/acheter" in href:
+            url = absolute_url(base, href)
+            title = first_text(a.select_one("h2, h3, .title, [class*='title']")) or first_text(a)
+            if title and len(title) >= 5:
+                out.append(Announcement("overnamemarkt", title, url, {}))
 
     uniq = {}
     for x in out:
         uniq[x.url] = x
-    return list(uniq.values())[:200]
+    return list(uniq.values())[:250]
 
 
 def parse_bedrijventekoop(html: str) -> List[Announcement]:
     base = "https://www.bedrijventekoop.be"
     soup = soupify(html)
+    out: List[Announcement] = []
 
-    out = []
-    cards = soup.select("a[href*='/te-koop-aangeboden/'], a[href*='/te-koop/'], article, [class*='card'], [class*='listing']")
-    for el in cards:
-        a = el if el.name == "a" else el.select_one("a[href]")
-        if not a:
-            continue
+    for a in soup.select("a[href]"):
         href = a.get("href", "")
-        if "/te-koop" not in href:
-            continue
-        url = absolute_url(base, href)
-        title = first_text(el.select_one("h2, h3, .title, [class*='title']")) or first_text(a)
-        if not title or len(title) < 5:
-            continue
-        out.append(Announcement("bedrijventekoop", title, url, {}))
+        if "/te-koop" in href:
+            url = absolute_url(base, href)
+            title = first_text(a.select_one("h2, h3, .title, [class*='title']")) or first_text(a)
+            if title and len(title) >= 5:
+                out.append(Announcement("bedrijventekoop", title, url, {}))
 
     uniq = {}
     for x in out:
         uniq[x.url] = x
-    return list(uniq.values())[:200]
+    return list(uniq.values())[:250]
 
 
 def parse_cessionpro(html: str) -> List[Announcement]:
     base = "https://www.cessionpro.be"
     soup = soupify(html)
+    out: List[Announcement] = []
 
-    out = []
-    cards = soup.select("a[href*='cession'], a[href*='annonce'], a[href*='offre'], article, [class*='card'], [class*='listing']")
-    for el in cards:
-        a = el if el.name == "a" else el.select_one("a[href]")
-        if not a:
-            continue
+    for a in soup.select("a[href]"):
         href = a.get("href", "")
-        # keep internal links only
         if href.startswith("http") and "cessionpro.be" not in href:
             continue
-        url = absolute_url(base, href)
-        title = first_text(el.select_one("h2, h3, .title, [class*='title']")) or first_text(a)
-        if not title or len(title) < 5:
-            continue
-        out.append(Announcement("cessionpro", title, url, {}))
+        # heuristic: detail pages tend to include "cession" or "annonce"
+        if any(x in href.lower() for x in ["cession", "annonce", "offre", "a-vendre", "vendre"]):
+            url = absolute_url(base, href)
+            title = first_text(a.select_one("h2, h3, .title, [class*='title']")) or first_text(a)
+            if title and len(title) >= 5:
+                out.append(Announcement("cessionpro", title, url, {}))
 
     uniq = {}
     for x in out:
         uniq[x.url] = x
-    return list(uniq.values())[:200]
+    return list(uniq.values())[:250]
 
 
-# ----------------------------
-# Site registry
-# ----------------------------
 SiteParser = Callable[[str], List[Announcement]]
 
 SITES: List[Tuple[str, str, SiteParser]] = [
@@ -331,19 +433,44 @@ SITES: List[Tuple[str, str, SiteParser]] = [
 
 
 # ----------------------------
+# Message formatting
+# ----------------------------
+def format_item(ann: Announcement, fields: Dict[str, str]) -> str:
+    # Prefer extracted fields; fall back to listing meta where useful (e.g. type)
+    merged = dict(fields)
+    for k, v in (ann.meta or {}).items():
+        merged.setdefault(k, v)
+
+    lines = [ann.title]
+
+    def add(label: str, key: str):
+        v = merged.get(key, "")
+        if v:
+            lines.append(f"{label}: {v}")
+
+    add("Type", "type")
+    add("Secteur", "sector")
+    add("Localisation", "location")
+    add("Prix", "price")
+    add("Chiffre d'affaires", "turnover")
+    add("EBITDA / Résultat", "ebitda")
+    add("Employés", "employees")
+    add("Référence", "reference")
+    add("Date", "date")
+    if merged.get("description"):
+        lines.append(f"Description: {merged['description']}")
+
+    lines.append(ann.url)
+    return "\n".join(lines)
+
+
+def is_horeca(type_value: str) -> bool:
+    return text_clean(type_value).lower() == "horeca"
+
+
+# ----------------------------
 # Main
 # ----------------------------
-def format_message(items: List[Announcement]) -> str:
-    # Compact Telegram message (one site at a time)
-    lines = []
-    for it in items:
-        line = f"{it.title}\n{it.url}"
-        if it.meta.get("type"):
-            line = f"{it.title} (type: {it.meta['type']})\n{it.url}"
-        lines.append(line)
-    return "\n\n".join(lines)
-
-
 def main():
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -351,38 +478,75 @@ def main():
     state = load_state()  # {site_name: [keys]}
     changed = False
 
-    for site_name, url, parser in SITES:
+    for site_name, list_url, parser in SITES:
         try:
-            html = http_get(url)
+            html = http_get(list_url)
         except Exception as e:
-            print(f"[{site_name}] fetch error:", e)
+            print(f"[{site_name}] listing fetch error:", e)
             time.sleep(SLEEP_BETWEEN_SITES_SEC)
             continue
 
         try:
             announcements = parser(html)
         except Exception as e:
-            print(f"[{site_name}] parse error:", e)
+            print(f"[{site_name}] listing parse error:", e)
             time.sleep(SLEEP_BETWEEN_SITES_SEC)
             continue
 
         seen_keys = set(state.get(site_name, []))
         new_items = [a for a in announcements if a.key not in seen_keys]
 
-        if new_items:
-            # Send only the new ones
-            msg = format_message(new_items[:20])  # cap to avoid huge telegram payloads
-            send_telegram(bot_token, chat_id, msg)
-
-            # Update state
-            for a in new_items:
-                seen_keys.add(a.key)
-            state[site_name] = list(seen_keys)
-            changed = True
-
-            print(f"[{site_name}] new announcements: {len(new_items)}")
-        else:
+        if not new_items:
             print(f"[{site_name}] no new announcements")
+            time.sleep(SLEEP_BETWEEN_SITES_SEC)
+            continue
+
+        sent_count = 0
+        print(f"[{site_name}] new announcements detected: {len(new_items)}")
+
+        for ann in new_items[:MAX_NEW_PER_SITE_PER_RUN]:
+            # Commerce-a-remettre special rule: skip type horeca
+            if site_name == "commerce-a-remettre":
+                t_meta = ann.meta.get("type", "")
+                if t_meta and is_horeca(t_meta):
+                    seen_keys.add(ann.key)
+                    changed = True
+                    continue
+
+            # Enrich from detail page
+            fields = {}
+            try:
+                fields = enrich_from_detail(ann.url)
+            except Exception as e:
+                # If detail fetch fails, still send minimal info but include URL
+                print(f"[{site_name}] detail fetch/parse error for {ann.url}:", e)
+                fields = {}
+
+            # Commerce-a-remettre: also apply horeca filter from detail fields
+            if site_name == "commerce-a-remettre":
+                t_detail = fields.get("type", "")
+                t_meta = ann.meta.get("type", "")
+                if (t_detail and is_horeca(t_detail)) or (t_meta and is_horeca(t_meta)):
+                    seen_keys.add(ann.key)
+                    changed = True
+                    continue
+
+            msg = format_item(ann, fields)
+            try:
+                send_telegram(bot_token, chat_id, msg)
+                sent_count += 1
+            except Exception as e:
+                print(f"[{site_name}] telegram send error:", e)
+
+            seen_keys.add(ann.key)
+            changed = True
+            time.sleep(SLEEP_BETWEEN_DETAILS_SEC)
+
+        state[site_name] = list(seen_keys)
+        if sent_count == 0:
+            print(f"[{site_name}] no alerts sent after filters")
+        else:
+            print(f"[{site_name}] alerts sent: {sent_count}")
 
         time.sleep(SLEEP_BETWEEN_SITES_SEC)
 
