@@ -1,0 +1,51 @@
+name: Acquisition Announcements Alerts
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # every hour (UTC)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml
+
+      - name: Run announcements scraper
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python acquisitions_alerts.py
+
+      - name: Commit state file if updated
+        run: |
+          if [ -f seen_announcements_by_site.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            if git status --porcelain | grep "seen_announcements_by_site.json"; then
+              git add seen_announcements_by_site.json
+              git commit -m "Update seen announcements state" || echo "No changes to commit"
+              git push
+            else
+              echo "No changes to seen_announcements_by_site.json"
+            fi
+          else
+            echo "State file not created yet; nothing to commit."
+          fi
