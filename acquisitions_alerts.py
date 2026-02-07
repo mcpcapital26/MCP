@@ -43,10 +43,10 @@ COFIM_MAX_PAGES = 3  # scan first N pages
 # Any announcement whose title/location/teaser contains ANY of these words
 # (case-insensitive, substring match) will be discarded.
 FORBIDDEN_WORDS = [
-    horeca,
-    traiteur,
-    bar,
-    restaurant
+    "horeca",
+    "traiteur",
+    "bar",
+    "restaurant"
 ]
 
 
