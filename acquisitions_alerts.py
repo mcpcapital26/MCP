@@ -37,6 +37,18 @@ COFIM_BASE = "https://www.cofim.be"
 COFIM_LISTING_URL = "https://www.cofim.be/fr/entreprises/entreprises-fonds-de-commerce"
 COFIM_MAX_PAGES = 3  # scan first N pages
 
+# ----------------------------
+# USER FILTER (editable)
+# ----------------------------
+# Any announcement whose title/location/teaser contains ANY of these words
+# (case-insensitive, substring match) will be discarded.
+FORBIDDEN_WORDS = [
+    horeca,
+    traiteur,
+    bar,
+    restaurant
+]
+
 
 @dataclass
 class Announcement:
@@ -126,10 +138,33 @@ def send_telegram(bot_token: str, chat_id: str, message: str) -> None:
 
 def build_cofim_page_url(page: int) -> str:
     # COFIM listing supports ?page=X (as seen in HTML: hidden input name="page")
-    # Keep URL stable:
     if page <= 1:
         return COFIM_LISTING_URL
     return f"{COFIM_LISTING_URL}?page={page}"
+
+
+def forbidden_hit(ann: "Announcement") -> str:
+    """
+    Returns the forbidden word that matched, or "" if none.
+    Checks title + selected meta fields.
+    """
+    words = [w.strip().lower() for w in FORBIDDEN_WORDS if w and w.strip()]
+    if not words:
+        return ""
+
+    hay = " ".join(
+        [
+            ann.title or "",
+            ann.meta.get("location", ""),
+            ann.meta.get("price", ""),
+            ann.meta.get("teaser", ""),
+        ]
+    ).lower()
+
+    for w in words:
+        if w in hay:
+            return w
+    return ""
 
 
 def parse_cofim_listing(html: str) -> List[Announcement]:
@@ -202,7 +237,16 @@ def parse_cofim_listing(html: str) -> List[Announcement]:
         if teaser:
             meta["teaser"] = teaser
 
-        out.append(Announcement(COFIM_SITE, title, url, meta))
+        ann = Announcement(COFIM_SITE, title, url, meta)
+
+        # Forbidden words filter
+        hit = forbidden_hit(ann)
+        if hit:
+            # Optional: keep as seen? No — we skip without marking seen,
+            # so if you later remove the word, it can alert again.
+            continue
+
+        out.append(ann)
 
     # Dedup by URL
     uniq: Dict[str, Announcement] = {}
@@ -247,7 +291,7 @@ def main() -> None:
 
         try:
             items = parse_cofim_listing(html)
-            print(f"[cofim] page {page}: {len(items)} items parsed")
+            print(f"[cofim] page {page}: {len(items)} items kept after filters")
             all_items.extend(items)
         except Exception as e:
             print(f"[cofim] parse error page={page}:", e)
@@ -265,7 +309,6 @@ def main() -> None:
         print("[cofim] no new announcements")
         return
 
-    # Sort new items by URL (stable). If you prefer "most recent first", we need a date/ordering field.
     new_items.sort(key=lambda x: x.url)
 
     sent = 0
