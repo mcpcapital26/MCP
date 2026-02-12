@@ -10,6 +10,13 @@
 #
 # State file (committed back to repo by workflow):
 #   seen_announcements_by_site.json
+#
+# Notes:
+# - Filters apply to ALL sites (accent-insensitive).
+# - SPA sites:
+#   * WE Transmission: discovers backend/api endpoints from JS bundle, caches working endpoint in state["_meta"].
+#   * Bedrijventekoop: tries POST listings endpoint; if it can’t, falls back to probing IDs (no-crash).
+# - Filtered/ignored items are still marked as "seen" so they don’t re-trigger every run.
 
 import os
 import re
@@ -18,15 +25,17 @@ import time
 import hashlib
 import unicodedata
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional, Callable
+from typing import List, Dict, Tuple, Optional, Callable, Any
 from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
-from typing import Optional
+
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-
+# =============================================================================
+# CONFIG
+# =============================================================================
 USER_AGENT = "Mozilla/5.0 (AcquisitionAnnouncementsBot; +https://github.com/)"
 STATE_FILE = "seen_announcements_by_site.json"
 
@@ -34,22 +43,17 @@ REQUEST_TIMEOUT = 35
 SLEEP_BETWEEN_PAGES_SEC = 1.0
 MAX_NEW_PER_RUN = 40  # cap to avoid spam/long runs
 
-# ----------------------------
-# USER FILTER (editable)
-# ----------------------------
 # Any announcement whose title/location/teaser/type/sector contains ANY of these words
-# (case-insensitive, substring match) will be discarded.
+# (case-insensitive, substring match, accent-insensitive) will be discarded.
 FORBIDDEN_WORDS = [
-     "horeca",
-     "restaurant",
+    "horeca",
+    "restaurant",
     "bar",
     "traiteur",
-    "alimentaire"
+    "alimentaire",
 ]
 
-# ----------------------------
 # URLS (your 6 sources)
-# ----------------------------
 URL1_COFIM = "https://www.cofim.be/fr/entreprises/entreprises-fonds-de-commerce"
 URL2_CAR = "https://www.commerce-a-remettre.be/recherche?region=&sector=&id="
 URL3_WE = "https://transmission.wallonie-entreprendre.be/"
@@ -57,26 +61,38 @@ URL4_OVERNAMEMARKT = "https://www.overnamemarkt.be/fr/acheter?sectors=bouw,diens
 URL5_BEDRIJVENTEKOOP = "https://www.bedrijventekoop.be/te-koop-aangeboden?sectors=2,4,12,2_216,2_217,2_218,2_83,2_222,2_219,2_86,2_94,2_93,2_91,2_220,2_221,2_87,2_92,2_233,2_89,2_85,2_223,2_99,2_224,2_225,2_90,2_84,4_12,4_13,4_15,4_14,4_101,8_51,8_62,8_53,8_59,8_64,8_230,8_242,8_54,8_204,8_67,8_229,8_60,8_215,8_66,8_105,8_52,8_49,8_56,8_234,8_88,8_241,8_65,8_228,8_55,12_208,12_61,12_206,12_108,12_207,12_205&regions=26,27,28,29,30,31,32,33,34,35,36,37,38,39"
 URL6_CESSIONPRO = "https://www.cessionpro.be/?secteurs-v4oj=entreprise-de-construction-a-remettre-en-belgique%7Ce-commerce-a-vendre-en-belgique%7Csociete-industrielle-a-vendre-en-belgique%7Csociete-de-service-a-vendre-en-belgique"
 
-# ----------------------------
 # Per-site paging limits
-# ----------------------------
 COFIM_MAX_PAGES = 3
 CAR_MAX_PAGES = 3
 OVERNAMEMARKT_MAX_PAGES = 3
-BEDRIJVENTEKOOP_MAX_PAGES = 2
-WE_MAX_PAGES = 1
 CESSIONPRO_MAX_PAGES = 1
 
-# Optional: focus CessionPro sectors (matches your URL6 intent)
-CESSIONPRO_ALLOWED_SECTORS = {
-    # Keep empty to allow all sectors
-    "Construction et achèvement",
-    "E-commerce / Web",
-    "Industrie",
-    "Service",
-}
+# CessionPro: keep empty to allow all sectors. If non-empty, only these exact sector labels are kept.
+CESSIONPRO_ALLOWED_SECTORS = set()
+
+# =============================================================================
+# STATE META (for caching endpoints / last ids)
+# =============================================================================
+META_KEY = "_meta"
+STATE_DIRTY = False  # set True whenever we update state meta (endpoint cache, last_id, etc.)
 
 
+def meta_get(state: Dict[str, Any], site: str, key: str, default=None):
+    return (state.get(META_KEY, {}) or {}).get(site, {}).get(key, default)
+
+
+def meta_set(state: Dict[str, Any], site: str, key: str, value):
+    global STATE_DIRTY
+    state.setdefault(META_KEY, {})
+    state[META_KEY].setdefault(site, {})
+    if state[META_KEY][site].get(key) != value:
+        state[META_KEY][site][key] = value
+        STATE_DIRTY = True
+
+
+# =============================================================================
+# TYPES
+# =============================================================================
 @dataclass
 class Announcement:
     site: str
@@ -88,7 +104,7 @@ class Announcement:
     def key(self) -> str:
         """
         Stable key for dedup/state:
-        - Prefer numeric ID segment if present (ex: /.../104308/...)
+        - Prefer numeric ID segment if present
         - Else last path segment
         - Else sha256(url+title)
         """
@@ -102,14 +118,17 @@ class Announcement:
                 return f"{self.site}:{segments[-1]}"
         except Exception:
             pass
-
         raw = (self.url or "") + "||" + (self.title or "")
         return f"{self.site}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
 
 
-# ----------------------------
-# HTTP helpers
-# ----------------------------
+FetchFn = Callable[[requests.Session, int], List[Announcement]]
+FormatFn = Callable[[Announcement], Optional[str]]
+
+
+# =============================================================================
+# HTTP HELPERS
+# =============================================================================
 def make_session() -> requests.Session:
     s = requests.Session()
     retry = Retry(
@@ -134,7 +153,6 @@ def http_get(session: requests.Session, url: str, extra_headers: Optional[Dict[s
     }
     if extra_headers:
         headers.update(extra_headers)
-
     r = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
     r.raise_for_status()
     return r.text
@@ -159,8 +177,31 @@ def http_post_form(
         headers["Referer"] = referer
     if extra_headers:
         headers.update(extra_headers)
-
     r = session.post(url, data=data, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+    r.raise_for_status()
+    return r.text
+
+
+def http_post_json(
+    session: requests.Session,
+    url: str,
+    body: Dict[str, Any],
+    referer: Optional[str] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> str:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "fr,en;q=0.8,nl;q=0.6",
+        "Accept": "application/json,text/plain,*/*",
+        "Connection": "keep-alive",
+        "Content-Type": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if referer:
+        headers["Referer"] = referer
+    if extra_headers:
+        headers.update(extra_headers)
+    r = session.post(url, json=body, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
     r.raise_for_status()
     return r.text
 
@@ -178,10 +219,6 @@ def absolute_url(base: str, href: str) -> str:
 
 
 def normalize_url(u: str) -> str:
-    """
-    Remove tracking params (utm_*) and fragments to stabilize dedup.
-    Keep functional query params.
-    """
     try:
         p = urlparse(u)
         q = [(k, v) for (k, v) in parse_qsl(p.query, keep_blank_values=True) if not k.lower().startswith("utm_")]
@@ -199,48 +236,67 @@ def norm_cmp(s: str) -> str:
     return s.lower().strip()
 
 
-# ----------------------------
-# State
-# ----------------------------
-def load_state() -> Dict[str, List[str]]:
+# =============================================================================
+# STATE I/O (preserves _meta dict)
+# =============================================================================
+def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
         return {}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, dict):
-                return {k: list(v) for k, v in data.items()}
+            if not isinstance(data, dict):
+                return {}
+            out: Dict[str, Any] = {}
+            for k, v in data.items():
+                if isinstance(v, list) or isinstance(v, dict):
+                    out[k] = v
+            return out
     except Exception:
-        pass
-    return {}
+        return {}
 
 
-def save_state(state: Dict[str, List[str]]) -> None:
+def save_state(state: Dict[str, Any]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
 
-# ----------------------------
-# Telegram
-# ----------------------------
-def send_telegram(bot_token: str, chat_id: str, message: str) -> None:
+# =============================================================================
+# TELEGRAM
+# =============================================================================
+def send_telegram(session: requests.Session, bot_token: str, chat_id: str, message: str) -> None:
     if not bot_token or not chat_id:
         print("Telegram not configured; skipping send.")
         return
+
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "disable_web_page_preview": True}
-    rr = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-    if not rr.ok:
+
+    # Small manual handling for 429 retry_after (GitHub runners can hit this occasionally)
+    for attempt in range(3):
+        rr = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        if rr.ok:
+            return
+        try:
+            j = rr.json()
+            retry_after = int(j.get("parameters", {}).get("retry_after", 0))
+        except Exception:
+            retry_after = 0
+        if rr.status_code == 429 and retry_after > 0:
+            time.sleep(min(60, retry_after + 1))
+            continue
         print("Telegram send failed:", rr.text)
+        return
 
 
-# ----------------------------
-# Filters
-# ----------------------------
+# =============================================================================
+# FILTERS (apply to ALL sites, accent-insensitive)
+# =============================================================================
 def forbidden_hit(ann: Announcement) -> str:
-    words = [w.strip().lower() for w in FORBIDDEN_WORDS if w and w.strip()]
+    words = [norm_cmp(w) for w in FORBIDDEN_WORDS if w and w.strip()]
     if not words:
         return ""
+
     hay = " ".join(
         [
             ann.title or "",
@@ -252,27 +308,28 @@ def forbidden_hit(ann: Announcement) -> str:
             ann.meta.get("branche", ""),
             ann.meta.get("region", ""),
             ann.meta.get("description", ""),
+            ann.meta.get("turnover", ""),
+            ann.meta.get("omzet", ""),
         ]
-    ).lower()
+    )
+    hay_n = norm_cmp(hay)
+
     for w in words:
-        if w in hay:
+        if w and w in hay_n:
             return w
     return ""
 
 
-# ----------------------------
-# Generic runner
-# ----------------------------
-FetchFn = Callable[[requests.Session, int], List[Announcement]]
-FormatFn = Callable[[Announcement], Optional[str]]
-
+# =============================================================================
+# GENERIC RUNNER (HTML/list pages)
+# =============================================================================
 def run_site(
     session: requests.Session,
     site_name: str,
     fetch_fn: FetchFn,
     format_fn: FormatFn,
     max_pages: int,
-    state: Dict[str, List[str]],
+    state: Dict[str, Any],
     bot_token: str,
     chat_id: str,
 ) -> Tuple[int, int, bool]:
@@ -280,10 +337,10 @@ def run_site(
     Returns: (new_detected, alerts_sent, changed_state)
     Behavior:
       - Items matching FORBIDDEN_WORDS are marked as seen (so they don't resurface).
-      - Items returning None/"" from formatter are marked as seen (inactive / filtered after enrichment).
-      - MAX_NEW_PER_RUN only limits sent alerts; non-sent non-filtered items remain unsent for next run.
+      - Items returning None/"" from formatter are marked as seen.
+      - MAX_NEW_PER_RUN only limits sent alerts; remaining items stay "new" for next run.
     """
-    seen = set(state.get(site_name, []))
+    seen = set(state.get(site_name, [])) if isinstance(state.get(site_name, []), list) else set()
     changed = False
 
     all_items: List[Announcement] = []
@@ -310,42 +367,101 @@ def run_site(
     new_items.sort(key=lambda x: x.url)
 
     sent = 0
-    processed = 0
-
     for ann in new_items:
-        # 1) If forbidden -> mark seen and skip (does not count against MAX_NEW_PER_RUN)
         if forbidden_hit(ann):
             seen.add(ann.key)
             changed = True
-            processed += 1
             continue
 
-        # 2) If we already hit the send cap, stop here (leave remaining as "new" for next run)
         if sent >= MAX_NEW_PER_RUN:
             break
 
-        # 3) Format (may enrich and decide to skip -> returns None/"")
-        msg = None
+        msg: Optional[str] = None
         try:
             msg = format_fn(ann)
         except Exception as e:
             print(f"[{site_name}] format error: {e}")
 
         if not msg:
-            # Mark as seen so it doesn't re-trigger (inactive, filtered-after-enrichment, etc.)
             seen.add(ann.key)
             changed = True
-            processed += 1
             continue
 
-        # 4) Send
         try:
-            send_telegram(bot_token, chat_id, msg)
+            send_telegram(session, bot_token, chat_id, msg)
             sent += 1
-            # Mark as seen only after a successful send (so it retries if Telegram fails)
             seen.add(ann.key)
             changed = True
-            processed += 1
+        except Exception as e:
+            print(f"[{site_name}] telegram send error: {e}")
+
+        time.sleep(0.5)
+
+    state[site_name] = list(seen)
+    return (len(new_items), sent, changed)
+
+
+# =============================================================================
+# DIRECT RUNNER (API/SPA/fallback sites that need state meta)
+# =============================================================================
+def run_site_direct(
+    session: requests.Session,
+    site_name: str,
+    fetch_items_fn: Callable[[requests.Session, Dict[str, Any]], List[Announcement]],
+    format_fn: FormatFn,
+    state: Dict[str, Any],
+    bot_token: str,
+    chat_id: str,
+) -> Tuple[int, int, bool]:
+    seen = set(state.get(site_name, [])) if isinstance(state.get(site_name, []), list) else set()
+    changed = False
+
+    try:
+        items = fetch_items_fn(session, state)
+        print(f"[{site_name}] fetched {len(items)} items (direct)")
+    except Exception as e:
+        print(f"[{site_name}] fetch error (direct): {e}")
+        return (0, 0, False)
+
+    # Dedup by key
+    uniq_by_key: Dict[str, Announcement] = {}
+    for it in items:
+        uniq_by_key[it.key] = it
+    items = list(uniq_by_key.values())
+
+    new_items = [a for a in items if a.key not in seen]
+    if not new_items:
+        print(f"[{site_name}] no new announcements")
+        return (0, 0, False)
+
+    new_items.sort(key=lambda x: x.url)
+
+    sent = 0
+    for ann in new_items:
+        if forbidden_hit(ann):
+            seen.add(ann.key)
+            changed = True
+            continue
+
+        if sent >= MAX_NEW_PER_RUN:
+            break
+
+        msg: Optional[str] = None
+        try:
+            msg = format_fn(ann)
+        except Exception as e:
+            print(f"[{site_name}] format error: {e}")
+
+        if not msg:
+            seen.add(ann.key)
+            changed = True
+            continue
+
+        try:
+            send_telegram(session, bot_token, chat_id, msg)
+            sent += 1
+            seen.add(ann.key)
+            changed = True
         except Exception as e:
             print(f"[{site_name}] telegram send error: {e}")
 
@@ -365,7 +481,6 @@ COFIM_BASE = "https://www.cofim.be"
 def build_cofim_page_url(page: int) -> str:
     if page <= 1:
         return URL1_COFIM
-    # cofim uses ?page=N
     p = urlparse(URL1_COFIM)
     q = dict(parse_qsl(p.query, keep_blank_values=True))
     q["page"] = str(page)
@@ -388,7 +503,7 @@ def parse_cofim_listing(html: str) -> List[Announcement]:
         if not url:
             continue
 
-        # Filter sold (banner-sold image)
+        # sold flag
         flag = box.select_one("img.flag")
         flag_src = (flag.get("src", "") if flag else "").lower()
         if "banner-sold" in flag_src:
@@ -430,7 +545,6 @@ def parse_cofim_listing(html: str) -> List[Announcement]:
 
         out.append(Announcement(COFIM_SITE, title, url, meta))
 
-    # Dedup by URL
     uniq: Dict[str, Announcement] = {}
     for x in out:
         uniq[x.url] = x
@@ -439,14 +553,10 @@ def parse_cofim_listing(html: str) -> List[Announcement]:
 
 def fetch_cofim(session: requests.Session, page: int) -> List[Announcement]:
     url = build_cofim_page_url(page)
-    # try “browser-ish” headers if needed
     html = http_get(
         session,
         url,
-        extra_headers={
-            "Upgrade-Insecure-Requests": "1",
-            "Referer": COFIM_BASE,
-        },
+        extra_headers={"Upgrade-Insecure-Requests": "1", "Referer": COFIM_BASE},
     )
     return parse_cofim_listing(html)
 
@@ -474,10 +584,7 @@ CAR_BASE = "https://www.commerce-a-remettre.be"
 
 
 def build_car_page_url(page: int) -> str:
-    """
-    Their pagination is 0-based: ?page=0 for first page.
-    We'll map page(1)->0, page(2)->1, ...
-    """
+    # 0-based paging
     p0 = max(0, page - 1)
     p = urlparse(URL2_CAR)
     q = dict(parse_qsl(p.query, keep_blank_values=True))
@@ -500,9 +607,7 @@ def parse_car_listing(html: str) -> List[Announcement]:
         if not url:
             continue
 
-        title = ""
-        if a:
-            title = text_clean(a.get_text(" "))
+        title = text_clean(a.get_text(" ")) if a else ""
         if not title:
             meta_name = item.select_one("meta[itemprop='name']")
             title = text_clean(meta_name.get("content", "")) if meta_name else ""
@@ -579,7 +684,7 @@ def format_car(ann: Announcement) -> str:
 # =============================================================================
 # SITE 4 — overnamemarkt.be
 # =============================================================================
-SITE4 = "overnamemarkt"
+OV_SITE = "overnamemarkt"
 OV_BASE = "https://www.overnamemarkt.be"
 
 
@@ -608,27 +713,21 @@ def parse_overnamemarkt_listing(html: str) -> List[Announcement]:
     soup = soupify(html)
     out: List[Announcement] = []
 
-    # cards are links to /fr/kopen/...
     for a in soup.select('a[href*="/fr/kopen/"]'):
         href = a.get("href", "")
-        if not href:
-            continue
-        if "/fr/kopen/" not in href:
+        if not href or "/fr/kopen/" not in href:
             continue
 
         url = normalize_url(absolute_url(OV_BASE, href))
 
-        # title
         title_el = a.select_one('span[class*="text-h4"]')
         title = text_clean(title_el.get_text(" ", strip=True)) if title_el else ""
         if not title:
-            # fallback: first span
             sp = a.find("span")
             title = text_clean(sp.get_text(" ", strip=True)) if sp else ""
         if not title:
             title = "(sans titre)"
 
-        # location (via map-marker icon)
         location = ""
         icon = a.select_one('i[class*="fa-map-marker"]')
         if icon and icon.parent:
@@ -639,11 +738,10 @@ def parse_overnamemarkt_listing(html: str) -> List[Announcement]:
         price = _find_value_by_label_in_anchor(a, "Prix")
         turnover = _find_value_by_label_in_anchor(a, "Chiffre d'affaires") or _find_value_by_label_in_anchor(a, "Chiffre d’affaires")
 
-        # sector badge (best effort)
         sector = ""
         for sp in a.find_all("span"):
             cls = " ".join(sp.get("class", [])).lower()
-            if "inline-flex" in cls and sp.find("i") and "fa" in " ".join(sp.find("i").get("class", [])).lower():
+            if "inline-flex" in cls and sp.find("i"):
                 sector = text_clean(sp.get_text(" ", strip=True))
                 break
 
@@ -657,7 +755,7 @@ def parse_overnamemarkt_listing(html: str) -> List[Announcement]:
         if sector:
             meta["sector"] = sector
 
-        out.append(Announcement(SITE4, title, url, meta))
+        out.append(Announcement(OV_SITE, title, url, meta))
 
     uniq: Dict[str, Announcement] = {}
     for x in out:
@@ -686,23 +784,20 @@ def format_overnamemarkt(ann: Announcement) -> str:
 
 
 # =============================================================================
-# SITE 6 — cessionpro.be (Webflow/Jetboost-ish)
+# SITE 6 — cessionpro.be
 # =============================================================================
-SITE6 = "cessionpro"
+C6_SITE = "cessionpro"
 C6_BASE = "https://www.cessionpro.be"
 
 
 def is_new_c6_item(item: BeautifulSoup) -> bool:
-    # Prefer explicit badge class (as in your TS)
     for el in item.select(".text-block-162, .badge, .label"):
         if norm_cmp(el.get_text(" ", strip=True)) == "nouveau":
             return True
-    # fallback: any text containing "nouveau"
     return "nouveau" in norm_cmp(item.get_text(" ", strip=True))
 
 
 def parse_c6_item(item: BeautifulSoup) -> Optional[Announcement]:
-    # URL (button to detail)
     a = item.select_one('a[href^="/annonces/"]')
     href = a.get("href", "").strip() if a else ""
     if not href:
@@ -717,16 +812,17 @@ def parse_c6_item(item: BeautifulSoup) -> Optional[Announcement]:
     location = pick(".jobcard1 .localisation .text-block-117") or pick(".localisation .text-block-117")
     location = re.sub(r"^📍\s*", "", location).strip()
 
-    # price + turnover appear in multiple text-block-116
     blocks = [text_clean(x.get_text(" ", strip=True)) for x in item.select(".jobcard1 .date-4 .text-block-116")]
     price = blocks[0] if blocks else ""
     turnover = blocks[1] if len(blocks) >= 2 else ""
 
     sector = pick(".jobcard1 .div-block-196 .text-block-145") or pick(".div-block-196 .text-block-145")
 
-    # Optional deeper fields
     reference = pick(".secondcard .text-block-163")
-    description = pick(".secondcard .rich-text-block-annonce") or text_clean(item.select_one(".secondcard").get_text(" ", strip=True)) if item.select_one(".secondcard") else ""
+    description = ""
+    rich = item.select_one(".secondcard .rich-text-block-annonce")
+    if rich:
+        description = text_clean(rich.get_text(" ", strip=True))
 
     email = ""
     phone = ""
@@ -755,21 +851,15 @@ def parse_c6_item(item: BeautifulSoup) -> Optional[Announcement]:
     if phone:
         meta["phone"] = phone
 
-    # Optional sector focus
-    if CESSIONPRO_ALLOWED_SECTORS:
-        if sector and sector not in CESSIONPRO_ALLOWED_SECTORS:
-            return None
+    if CESSIONPRO_ALLOWED_SECTORS and sector and sector not in CESSIONPRO_ALLOWED_SECTORS:
+        return None
 
-    return Announcement(SITE6, title, url, meta)
+    return Announcement(C6_SITE, title, url, meta)
 
 
 def parse_cessionpro_listing(html: str, only_new: bool = True) -> List[Announcement]:
     soup = soupify(html)
-
-    items = soup.select('div[role="listitem"].collectionitem.w-dyn-item')
-    if not items:
-        # fallback: webflow dyn item class only
-        items = soup.select("div.w-dyn-item")
+    items = soup.select('div[role="listitem"].collectionitem.w-dyn-item') or soup.select("div.w-dyn-item")
 
     out: List[Announcement] = []
     for el in items:
@@ -779,7 +869,6 @@ def parse_cessionpro_listing(html: str, only_new: bool = True) -> List[Announcem
         if ann:
             out.append(ann)
 
-    # De-dupe by URL
     uniq: Dict[str, Announcement] = {}
     for x in out:
         uniq[x.url] = x
@@ -787,7 +876,7 @@ def parse_cessionpro_listing(html: str, only_new: bool = True) -> List[Announcem
 
 
 def fetch_cessionpro(session: requests.Session, page: int) -> List[Announcement]:
-    # No pagination used here; page ignored
+    _ = page
     html = http_get(session, URL6_CESSIONPRO, extra_headers={"Referer": C6_BASE})
     return parse_cessionpro_listing(html, only_new=True)
 
@@ -805,7 +894,9 @@ def format_cessionpro(ann: Announcement) -> str:
     if ann.meta.get("reference"):
         lines.append(f"Réf: {ann.meta['reference']}")
     if ann.meta.get("email") or ann.meta.get("phone"):
-        lines.append(f"Contact: {ann.meta.get('email','')}{' ' if ann.meta.get('email') and ann.meta.get('phone') else ''}{ann.meta.get('phone','')}".strip())
+        lines.append(
+            f"Contact: {ann.meta.get('email','')}{' ' if ann.meta.get('email') and ann.meta.get('phone') else ''}{ann.meta.get('phone','')}".strip()
+        )
     if ann.meta.get("description"):
         d = ann.meta["description"]
         if len(d) > 280:
@@ -816,10 +907,272 @@ def format_cessionpro(ann: Announcement) -> str:
 
 
 # =============================================================================
-# SITE 5 — bedrijventekoop.be (POST /listings-post + detail enrichment)
+# SITE 3 — WE Transmission (Wallonie Entreprendre) — SPA via backend API discovery
 # =============================================================================
-SITE5 = "bedrijventekoop"
+WET_SITE = "we-transmission"
+WET_BASE = "https://transmission.wallonie-entreprendre.be"
+WET_CATALOGUE_URL = f"{WET_BASE}/catalogue"
+WET_PAGES_TO_TRY = 3
+
+
+def safe_json_loads(text: str):
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def find_best_list_in_json(obj):
+    best = []
+
+    def walk(x):
+        nonlocal best
+        if isinstance(x, list):
+            if x and all(isinstance(i, dict) for i in x):
+                score = 0
+                for k in ("title", "titre", "name", "nom", "headline", "libelle"):
+                    if k in x[0]:
+                        score += 1
+                if score > 0 and len(x) > len(best):
+                    best = x
+            for i in x:
+                walk(i)
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+
+    walk(obj)
+    return best
+
+
+def pick_first(d: dict, keys):
+    for k in keys:
+        if k in d and d[k] not in (None, "", []):
+            return d[k]
+    return None
+
+
+def discover_wet_api_endpoints(session: requests.Session) -> List[str]:
+    html = http_get(session, WET_CATALOGUE_URL)
+
+    script_srcs = set(re.findall(r'src=["\'](/assets/[^"\']+\.js)["\']', html))
+    if not script_srcs:
+        script_srcs = set(re.findall(r'(/assets/[^"\']+\.js)', html))
+
+    bundles = list(script_srcs)[:8]
+    candidates = set()
+
+    for src in bundles:
+        js_url = absolute_url(WET_BASE, src)
+        try:
+            js = http_get(session, js_url)
+        except Exception:
+            continue
+
+        # Absolute URLs
+        for m in re.findall(r'https?://[^"\']+?/backend/api/v1/[^"\']+', js):
+            candidates.add(m)
+
+        # Relative paths
+        for m in re.findall(r'(/backend/api/v1/[^"\']+)', js):
+            candidates.add(absolute_url(WET_BASE, m))
+
+        # Also capture plain base if present
+        for m in re.findall(r'https?://[^"\']+?/backend/api/v1\b', js):
+            candidates.add(m)
+
+    expanded = set(candidates)
+
+    # If we only have the base ".../backend/api/v1", expand with common suffixes
+    for u in list(candidates):
+        if re.search(r"/backend/api/v1/?$", u):
+            base = u.rstrip("/")
+            for suf in (
+                "/catalogue",
+                "/catalog",
+                "/offres",
+                "/offers",
+                "/annonces",
+                "/listings",
+                "/public/offres",
+                "/public/offers",
+                "/public/annonces",
+                "/public/listings",
+                "/search",
+            ):
+                expanded.add(base + suf)
+
+    def score(u: str) -> int:
+        lu = u.lower()
+        s = 0
+        for kw in ("catalog", "offre", "offer", "listing", "annonce", "search", "public"):
+            if kw in lu:
+                s += 10
+        if lu.endswith(".js"):
+            s -= 50
+        return s
+
+    ranked = sorted(expanded, key=lambda x: (-score(x), x))
+    return ranked[:60]
+
+
+def wet_items_to_announcements(items: list) -> List[Announcement]:
+    out: List[Announcement] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+
+        title = text_clean(str(pick_first(it, ["title", "titre", "name", "nom", "headline"]) or ""))
+        if len(title) < 3:
+            continue
+
+        url = pick_first(it, ["url", "detailUrl", "permalink", "href", "link"])
+        if url:
+            url = normalize_url(absolute_url(WET_BASE, str(url)))
+        else:
+            _id = pick_first(it, ["id", "uuid", "reference", "ref"])
+            slug = pick_first(it, ["slug"])
+            if _id and slug:
+                url = f"{WET_BASE}/offres/{_id}-{slug}"
+            elif _id:
+                url = f"{WET_BASE}/offres/{_id}"
+            else:
+                url = WET_CATALOGUE_URL
+
+        meta: Dict[str, str] = {}
+        loc = pick_first(it, ["location", "localisation", "ville", "city", "region", "province"])
+        if loc:
+            meta["location"] = text_clean(str(loc))
+
+        sector = pick_first(it, ["sector", "secteur", "activity", "domaine"])
+        if sector:
+            meta["sector"] = text_clean(str(sector))
+
+        teaser = pick_first(it, ["teaser", "summary", "resume", "descriptionShort", "shortDescription"])
+        if teaser:
+            meta["teaser"] = text_clean(str(teaser))
+
+        ann = Announcement(WET_SITE, title, url, meta)
+        if forbidden_hit(ann):
+            continue
+        out.append(ann)
+
+    uniq: Dict[str, Announcement] = {}
+    for a in out:
+        uniq[a.url] = a
+    return list(uniq.values())
+
+
+def try_fetch_wet_listings_from_endpoint(session: requests.Session, url: str, page: int) -> List[Announcement]:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "fr,en;q=0.8,nl;q=0.6",
+        "Referer": WET_CATALOGUE_URL,
+    }
+
+    # GET param conventions
+    param_sets = [
+        {"page": page, "size": 20},
+        {"page": page - 1, "size": 20},  # 0-based
+        {"pageNumber": page, "pageSize": 20},
+        {"p": page, "limit": 20},
+        {"offset": (page - 1) * 20, "limit": 20},
+    ]
+
+    for params in param_sets:
+        try:
+            r = session.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+            if r.status_code in (401, 403):
+                return []
+            if not r.ok:
+                continue
+            data = safe_json_loads(r.text)
+            if not data:
+                continue
+            items = find_best_list_in_json(data)
+            if items:
+                return wet_items_to_announcements(items)
+        except Exception:
+            pass
+
+    # POST body conventions
+    bodies = [
+        {"page": page, "size": 20},
+        {"page": page - 1, "size": 20},
+        {"pagination": {"page": page, "size": 20}},
+        {"offset": (page - 1) * 20, "limit": 20},
+        {"pageNumber": page, "pageSize": 20},
+    ]
+    for body in bodies:
+        try:
+            r = session.post(url, headers={**headers, "Content-Type": "application/json"}, json=body, timeout=REQUEST_TIMEOUT)
+            if r.status_code in (401, 403):
+                return []
+            if not r.ok:
+                continue
+            data = safe_json_loads(r.text)
+            if not data:
+                continue
+            items = find_best_list_in_json(data)
+            if items:
+                return wet_items_to_announcements(items)
+        except Exception:
+            pass
+
+    return []
+
+
+def fetch_wet_listings(session: requests.Session, state: Dict[str, Any]) -> List[Announcement]:
+    cached = meta_get(state, WET_SITE, "api_url", None)
+    endpoints = [cached] if cached else []
+    if not cached:
+        endpoints = discover_wet_api_endpoints(session)
+
+    for api_url in endpoints:
+        if not api_url:
+            continue
+
+        all_items: List[Announcement] = []
+        for page in range(1, WET_PAGES_TO_TRY + 1):
+            items = try_fetch_wet_listings_from_endpoint(session, api_url, page)
+            if page > 1 and not items:
+                break
+            all_items.extend(items)
+            time.sleep(0.6)
+
+        if all_items:
+            meta_set(state, WET_SITE, "api_url", api_url)
+            return all_items
+
+    # Keep useful debug for Actions logs
+    if not cached:
+        print("[we-transmission] no working endpoint found after discovery.")
+    return []
+
+
+def format_wet_message(ann: Announcement) -> str:
+    lines = [f"[WE Transmission] {ann.title}"]
+    if ann.meta.get("location"):
+        lines.append(f"Localisation: {ann.meta['location']}")
+    if ann.meta.get("sector"):
+        lines.append(f"Secteur: {ann.meta['sector']}")
+    if ann.meta.get("teaser"):
+        t = ann.meta["teaser"]
+        if len(t) > 280:
+            t = t[:280] + "…"
+        lines.append(f"Résumé: {t}")
+    lines.append(ann.url)
+    return "\n".join(lines)
+
+
+# =============================================================================
+# SITE 5 — bedrijventekoop.be (POST listings + fallback ID probing)
+# =============================================================================
+BTK_SITE = "bedrijventekoop"
 BTK_BASE = "https://www.bedrijventekoop.be"
+BTK_HOME_URL = BTK_BASE + "/"
+BTK_MAX_PROBE_PER_RUN = 40
 
 
 def btk_extract_token(html: str) -> str:
@@ -830,40 +1183,32 @@ def btk_extract_token(html: str) -> str:
     return ""
 
 
+def btk_guess_post_url(html: str) -> str:
+    if re.search(r'(["\'])\/listings-post\1', html):
+        return "/listings-post"
+    return "/listings-post"
+
+
 def btk_guess_webspace_locale(html: str) -> Tuple[str, str]:
     webspace = re.search(r'"webspace"\s*:\s*"([^"]+)"', html)
     locale = re.search(r'"locale"\s*:\s*"([^"]+)"', html)
     return (webspace.group(1) if webspace else "btkbe", locale.group(1) if locale else "nl_be")
 
 
-def btk_guess_post_url(html: str) -> str:
-    # try to find "/listings-post" in HTML/inline scripts
-    m = re.search(r'(["\'])\/listings-post\1', html)
-    if m:
-        return "/listings-post"
-    # default
-    return "/listings-post"
-
-
 def parse_btk_list_fragment(html_fragment: str) -> List[Announcement]:
     soup = soupify(html_fragment)
     out: List[Announcement] = []
 
-    # known detail patterns:
-    # /te-koop-aangeboden/<id>/<slug>
-    # /for-sale/<id>/<slug>
     for a in soup.select('a[href*="/te-koop-aangeboden/"], a[href*="/for-sale/"]'):
-        href = a.get("href", "").strip()
+        href = (a.get("href") or "").strip()
         if not href:
             continue
         if "/te-koop-aangeboden/" not in href and "/for-sale/" not in href:
             continue
-
         url = normalize_url(absolute_url(BTK_BASE, href))
         title = text_clean(a.get_text(" ", strip=True)) or "(title pending)"
-        out.append(Announcement(SITE5, title, url, {}))
+        out.append(Announcement(BTK_SITE, title, url, {}))
 
-    # De-dupe by URL
     uniq: Dict[str, Announcement] = {}
     for x in out:
         uniq[x.url] = x
@@ -874,17 +1219,15 @@ def parse_btk_detail(html: str) -> Dict[str, str]:
     soup = soupify(html)
     meta: Dict[str, str] = {}
 
-    # title
     h1 = soup.find("h1")
     if h1:
         meta["title"] = text_clean(h1.get_text(" ", strip=True))
 
-    # sold/inactive detection
     page_text = norm_cmp(soup.get_text(" ", strip=True))
     if "verkocht" in page_text or "inactief" in page_text:
         meta["inactive"] = "true"
 
-    # Try dl/dt/dd extraction
+    # dl/dt/dd blocks often exist
     def dl_value(label: str) -> str:
         for dt in soup.find_all("dt"):
             if norm_cmp(dt.get_text(" ", strip=True)) == norm_cmp(label):
@@ -893,123 +1236,28 @@ def parse_btk_detail(html: str) -> Dict[str, str]:
                     return text_clean(dd.get_text(" ", strip=True))
         return ""
 
-    # Fallback: headings + next text blocks
-    def loose_value(label: str) -> str:
-        # find exact label node and take next non-empty text
-        for node in soup.find_all(string=True):
-            if norm_cmp(text_clean(node)) == norm_cmp(label):
-                cur = node.parent
-                nxt = cur.find_next(string=True)
-                # skip same label
-                while nxt and norm_cmp(text_clean(nxt)) in ("", norm_cmp(label)):
-                    nxt = BeautifulSoup(str(nxt), "lxml").string  # safe no-op
-                    break
-        return ""
-
-    meta["region"] = dl_value("Regio") or ""
-    meta["branche"] = dl_value("Branche") or ""
+    meta["region"] = dl_value("Regio") or dl_value("Region") or ""
+    meta["branche"] = dl_value("Branche") or dl_value("Sector") or ""
     meta["omzet"] = dl_value("Omzet") or dl_value("Omzet indicatie") or ""
     meta["overname"] = dl_value("Overname") or dl_value("Indicatie overnamebedrag") or ""
     meta["resultaat"] = dl_value("Resultaat voor belasting") or ""
 
-    # Best-effort “Aangeboden sinds …”
     m = re.search(r"Aangeboden sinds\s+([0-9]{1,2}\s+\w+\s+[0-9]{4})", soup.get_text(" ", strip=True), flags=re.I)
     if m:
         meta["listed_since"] = m.group(1)
 
-    # Clean empties
     return {k: v for k, v in meta.items() if v}
 
 
-def fetch_bedrijventekoop(session: requests.Session, page: int) -> List[Announcement]:
-    # 1) GET the filtered listing page (your URL5)
-    landing_url = URL5_BEDRIJVENTEKOOP
-    landing_html = http_get(session, landing_url, extra_headers={"Referer": BTK_BASE})
-
-    token = btk_extract_token(landing_html)
-    webspace, locale = btk_guess_webspace_locale(landing_html)
-    post_path = btk_guess_post_url(landing_html)
-    post_url = absolute_url(BTK_BASE, post_path)
-
-    # filters from URL
-    p = urlparse(URL5_BEDRIJVENTEKOOP)
-    q = dict(parse_qsl(p.query, keep_blank_values=True))
-    sectors_csv = q.get("sectors", "")
-    regions_csv = q.get("regions", "")
-
-    # 2) Try multiple payloads (form-encoded)
-    candidates: List[Dict[str, str]] = []
-
-    # A: basic page
-    candidates.append({"page": str(page), "webspace": webspace, "locale": locale})
-
-    # B: alternative pagination key
-    candidates.append({"p": str(page), "webspace": webspace, "locale": locale})
-
-    # C: JSON payload style
-    filter_obj = {
-        "q": "",
-        "sectors": sectors_csv.split(",") if sectors_csv else [],
-        "regions": [int(x) for x in regions_csv.split(",") if x.isdigit()] if regions_csv else [],
-        "archived": False,
-        "purposeType": 1,
-        "page": page,
-    }
-    candidates.append({"webspace": webspace, "locale": locale, "payload": json.dumps(filter_obj)})
-
-    # D: offset/limit
-    candidates.append({"webspace": webspace, "locale": locale, "offset": str((page - 1) * 20), "limit": "20"})
-
-    extra_headers = {}
-    if token:
-        extra_headers["X-CSRF-TOKEN"] = token
-
-    body = None
-    for data in candidates:
-        try:
-            resp = http_post_form(session, post_url, data=data, referer=landing_url, extra_headers=extra_headers)
-        except Exception:
-            continue
-
-        # accept if it looks like it contains detail links
-        if "/te-koop-aangeboden/" in resp or "/for-sale/" in resp:
-            body = resp
-            break
-
-        # sometimes JSON with html inside
-        try:
-            j = json.loads(resp)
-            if isinstance(j, dict):
-                blob = ""
-                for v in j.values():
-                    if isinstance(v, str) and ("/te-koop-aangeboden/" in v or "/for-sale/" in v):
-                        blob = v
-                        break
-                if blob:
-                    body = blob
-                    break
-        except Exception:
-            pass
-
-    if body is None:
-        raise RuntimeError(
-            "site5: POST /listings-post accepted none of the candidate payloads. "
-            "Open DevTools > Network on the listing page and copy the exact XHR payload to lock it in."
-        )
-
-    return parse_btk_list_fragment(body)
-
-
-def format_bedrijventekoop(ann: Announcement) -> Optional[str]:
-    # Enrich by fetching detail page (only when sending)
+def format_bedrijventekoop_enriched(session: requests.Session, ann: Announcement) -> Optional[str]:
+    # Enrich by fetching detail page
     meta = dict(ann.meta or {})
     title = ann.title
 
     try:
-        html = http_get(_GLOBAL_SESSION, ann.url, extra_headers={"Referer": BTK_BASE})
+        html = http_get(session, ann.url, extra_headers={"Referer": BTK_BASE})
         d = parse_btk_detail(html)
 
-        # Skip inactive/sold listings entirely (and mark seen in runner because we return None)
         if d.get("inactive") == "true":
             return None
 
@@ -1017,9 +1265,8 @@ def format_bedrijventekoop(ann: Announcement) -> Optional[str]:
             title = d["title"]
         meta.update(d)
     except Exception as e:
-        print(f"[site5] detail enrichment failed: {e}")
+        print(f"[bedrijventekoop] detail enrichment failed: {e}")
 
-    # IMPORTANT: re-run forbidden filter AFTER enrichment (branche/region/etc now available)
     enriched = Announcement(ann.site, title, ann.url, meta)
     if forbidden_hit(enriched):
         return None
@@ -1041,193 +1288,235 @@ def format_bedrijventekoop(ann: Announcement) -> Optional[str]:
     return "\n".join(lines)
 
 
+def extract_btk_ids_from_html(html: str) -> List[int]:
+    """
+    Try to extract listing IDs from HTML/inline JSON.
+    Supports:
+      - /te-koop-aangeboden/<id>
+      - "listingId": 12345, "id":12345 near te-koop-aangeboden
+    """
+    ids = set()
 
-# =============================================================================
-# SITE 3 — WE Transmission (SPA best-effort discovery)
-# =============================================================================
-SITE3 = "we-transmission"
-WE_BASE = "https://transmission.wallonie-entreprendre.be"
+    for m in re.findall(r"/te-koop-aangeboden/(\d{3,})", html):
+        try:
+            ids.add(int(m))
+        except Exception:
+            pass
 
+    # inline JSON-ish IDs (best effort)
+    for m in re.findall(r'"listingId"\s*:\s*(\d{3,})', html):
+        try:
+            ids.add(int(m))
+        except Exception:
+            pass
 
-def we_discover_bundle_urls(html: str) -> List[str]:
-    soup = soupify(html)
-    urls: List[str] = []
-    # Vite often uses <script type="module" src="/assets/index-....js">
-    for s in soup.select('script[type="module"][src]'):
-        src = s.get("src", "")
-        if src and src.endswith(".js"):
-            urls.append(absolute_url(WE_BASE, src))
-    # fallback: any script /assets/*.js
-    for s in soup.select("script[src]"):
-        src = s.get("src", "")
-        if src and "/assets/" in src and src.endswith(".js"):
-            urls.append(absolute_url(WE_BASE, src))
-    # de-dupe
-    out = []
-    seen = set()
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
+    # cautious: "id":12345 but only if page mentions te-koop-aangeboden somewhere
+    if "/te-koop-aangeboden" in html:
+        for m in re.findall(r'"id"\s*:\s*(\d{3,})', html):
+            try:
+                ids.add(int(m))
+            except Exception:
+                pass
 
-
-def we_extract_candidate_endpoints(js: str) -> List[str]:
-    endpoints = set()
-
-    # absolute URLs in bundle
-    for m in re.finditer(r"https?://[a-z0-9\.\-]+\.[a-z]{2,}(?:/[^\s\"'`<]*)?", js, flags=re.I):
-        u = m.group(0)
-        if "wallonie" in u or "entreprendre" in u or "transmission" in u:
-            endpoints.add(u)
-
-    # relative endpoints
-    for m in re.finditer(r'(["\'`])/(api|graphql|actions)/[a-z0-9/_\-]+(?:\?[^"\'`]*)?\1', js, flags=re.I):
-        endpoints.add(m.group(0)[1:-1])
-
-    for m in re.finditer(r'fetch\(\s*(["\'`])([^"\'`]+)\1', js, flags=re.I):
-        p = m.group(2)
-        if p.startswith("/api/") or p.startswith("/graphql") or p.startswith("/actions/"):
-            endpoints.add(p)
-
-    # rank with keywords
-    kws = ["catalogue", "annonce", "offre", "cession", "listing", "search", "filter"]
-    ranked = sorted(
-        endpoints,
-        key=lambda e: sum(1 for k in kws if k in norm_cmp(e)),
-        reverse=True,
-    )
-    return ranked
+    return sorted(ids)
 
 
-def we_json_probe(session: requests.Session, endpoint: str) -> Optional[List[Dict]]:
-    url = endpoint if endpoint.startswith("http") else absolute_url(WE_BASE, endpoint)
-    try:
-        r = session.get(
-            url,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "application/json,text/plain,*/*",
-                "Referer": WE_BASE,
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-        if not r.ok:
-            return None
-        data = r.json()
-    except Exception:
-        return None
+def fetch_btk_listings_via_post(session: requests.Session) -> Optional[List[Announcement]]:
+    landing_url = URL5_BEDRIJVENTEKOOP
+    landing_html = http_get(session, landing_url, extra_headers={"Referer": BTK_BASE})
 
-    # Normalize into list of dict objects
-    if isinstance(data, list) and data and isinstance(data[0], dict):
-        return data
+    token = btk_extract_token(landing_html)
+    webspace, locale = btk_guess_webspace_locale(landing_html)
+    post_url = absolute_url(BTK_BASE, btk_guess_post_url(landing_html))
 
-    if isinstance(data, dict):
-        # pick first list value that looks like listings
-        for v in data.values():
-            if isinstance(v, list) and v and isinstance(v[0], dict):
-                return v
+    p = urlparse(URL5_BEDRIJVENTEKOOP)
+    q = dict(parse_qsl(p.query, keep_blank_values=True))
+    sectors_csv = q.get("sectors", "")
+    regions_csv = q.get("regions", "")
+
+    extra_headers = {}
+    if token:
+        extra_headers["X-CSRF-TOKEN"] = token
+
+    # Try multiple payload styles (FORM + JSON)
+    for page in range(1, 3):  # keep it light; we only need newest
+        candidates_form: List[Dict[str, str]] = []
+
+        candidates_form.append({"page": str(page), "webspace": webspace, "locale": locale})
+        candidates_form.append({"p": str(page), "webspace": webspace, "locale": locale})
+
+        filter_obj = {
+            "q": "",
+            "sectors": sectors_csv.split(",") if sectors_csv else [],
+            "regions": [int(x) for x in regions_csv.split(",") if x.isdigit()] if regions_csv else [],
+            "archived": False,
+            "purposeType": 1,
+            "page": page,
+        }
+        candidates_form.append({"webspace": webspace, "locale": locale, "payload": json.dumps(filter_obj)})
+        candidates_form.append({"webspace": webspace, "locale": locale, "offset": str((page - 1) * 20), "limit": "20"})
+
+        for data in candidates_form:
+            try:
+                resp = http_post_form(session, post_url, data=data, referer=landing_url, extra_headers=extra_headers)
+            except Exception:
+                continue
+
+            # Sometimes JSON with HTML inside
+            if "/te-koop-aangeboden/" in resp or "/for-sale/" in resp:
+                return parse_btk_list_fragment(resp)
+
+            j = safe_json_loads(resp)
+            if isinstance(j, dict):
+                for v in j.values():
+                    if isinstance(v, str) and ("/te-koop-aangeboden/" in v or "/for-sale/" in v):
+                        return parse_btk_list_fragment(v)
+
+        # JSON post attempt
+        try:
+            resp2 = http_post_json(session, post_url, body=filter_obj, referer=landing_url, extra_headers=extra_headers)
+            if "/te-koop-aangeboden/" in resp2 or "/for-sale/" in resp2:
+                return parse_btk_list_fragment(resp2)
+            j2 = safe_json_loads(resp2)
+            if isinstance(j2, dict):
+                for v in j2.values():
+                    if isinstance(v, str) and ("/te-koop-aangeboden/" in v or "/for-sale/" in v):
+                        return parse_btk_list_fragment(v)
+        except Exception:
+            pass
+
     return None
 
 
-def fetch_we_transmission(session: requests.Session, page: int) -> List[Announcement]:
-    # page ignored; discovery + probe
-    html = http_get(session, URL3_WE, extra_headers={"Referer": WE_BASE})
-    bundle_urls = we_discover_bundle_urls(html)
-    if not bundle_urls:
-        print("[site3] no JS bundle URLs discovered (SPA).")
+def fetch_btk_detail_by_id(session: requests.Session, listing_id: int) -> Optional[Announcement]:
+    url_try = f"{BTK_BASE}/te-koop-aangeboden/{listing_id}"
+    r = session.get(
+        url_try,
+        headers={"User-Agent": USER_AGENT, "Accept-Language": "nl,fr;q=0.8,en;q=0.6"},
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=True,
+    )
+    if r.status_code == 404 or not r.ok:
+        return None
+
+    final_url = normalize_url(r.url)
+    soup = soupify(r.text)
+
+    h1 = soup.find("h1")
+    title = text_clean(h1.get_text(" ")) if h1 else ""
+    if len(title) < 3:
+        return None
+
+    txt = soup.get_text("\n", strip=True)
+    meta = {}
+
+    for label in ("Regio", "Provincie", "Plaats", "Locatie"):
+        m = re.search(rf"{label}\s*[:\-]\s*(.+)", txt, flags=re.I)
+        if m:
+            meta["location"] = text_clean(m.group(1))
+            break
+
+    for label in ("Branche", "Sector", "Categorie"):
+        m = re.search(rf"{label}\s*[:\-]\s*(.+)", txt, flags=re.I)
+        if m:
+            meta["sector"] = text_clean(m.group(1))
+            break
+
+    ann = Announcement(BTK_SITE, title, final_url, meta)
+    if forbidden_hit(ann):
+        return None
+    return ann
+
+
+def fetch_btk_listings_fallback(session: requests.Session, state: Dict[str, Any]) -> List[Announcement]:
+    """
+    Fallback strategy:
+      - scrape IDs from homepage + listing page HTML (if any)
+      - probe IDs newer than last_id
+    """
+    home_html = ""
+    list_html = ""
+    try:
+        home_html = http_get(session, BTK_HOME_URL)
+    except Exception:
+        pass
+    try:
+        list_html = http_get(session, URL5_BEDRIJVENTEKOOP, extra_headers={"Referer": BTK_BASE})
+    except Exception:
+        pass
+
+    ids = sorted(set(extract_btk_ids_from_html(home_html) + extract_btk_ids_from_html(list_html)))
+    if not ids:
         return []
 
-    endpoints: List[str] = []
-    for b in bundle_urls[:3]:  # don’t over-fetch
+    max_id = max(ids)
+    last_id = int(meta_get(state, BTK_SITE, "last_id", 0) or 0)
+
+    # first run: initialize without spamming
+    if last_id == 0:
+        meta_set(state, BTK_SITE, "last_id", max_id)
+        return []
+
+    if max_id <= last_id:
+        return []
+
+    new_items: List[Announcement] = []
+    to_probe = list(range(last_id + 1, max_id + 1))[:BTK_MAX_PROBE_PER_RUN]
+
+    highest_seen = last_id
+    for listing_id in to_probe:
         try:
-            js = http_get(session, b, extra_headers={"Referer": WE_BASE})
+            ann = fetch_btk_detail_by_id(session, listing_id)
+            if ann:
+                new_items.append(ann)
+            highest_seen = max(highest_seen, listing_id)
         except Exception:
-            continue
-        endpoints.extend(we_extract_candidate_endpoints(js))
+            highest_seen = max(highest_seen, listing_id)
+        time.sleep(0.6)
 
-    # de-dupe
-    seen = set()
-    endpoints = [e for e in endpoints if not (e in seen or seen.add(e))]
-
-    # probe candidates
-    for ep in endpoints[:40]:
-        if "graphql" in norm_cmp(ep):
-            continue  # skip GraphQL without schema knowledge
-        listings = we_json_probe(session, ep)
-        if not listings:
-            continue
-
-        out: List[Announcement] = []
-        for it in listings[:200]:
-            title = text_clean(str(it.get("title") or it.get("name") or it.get("titre") or "")) or "(sans titre)"
-            u = str(it.get("url") or it.get("link") or "")
-            if u:
-                url = normalize_url(u if u.startswith("http") else absolute_url(WE_BASE, u))
-            else:
-                # last resort: try slug/id
-                slug = it.get("slug") or it.get("id")
-                if slug:
-                    url = normalize_url(absolute_url(WE_BASE, f"/catalogue/{slug}"))
-                else:
-                    continue
-
-            meta = {}
-            for k in ["sector", "secteur", "location", "region", "price", "prix"]:
-                if it.get(k):
-                    meta[k] = text_clean(str(it.get(k)))
-            out.append(Announcement(SITE3, title, url, meta))
-
-        if out:
-            print(f"[site3] using endpoint: {ep}")
-            return out
-
-    # Nothing usable found
-    print("[site3] SPA detected; no usable JSON endpoint found. Endpoints discovered (first 20):")
-    for ep in endpoints[:20]:
-        print("  -", ep)
-    return []
+    meta_set(state, BTK_SITE, "last_id", highest_seen)
+    return new_items
 
 
-def format_we(ann: Announcement) -> str:
-    lines = [f"[WE Transmission] {ann.title}"]
-    # best-effort meta
-    loc = ann.meta.get("location") or ann.meta.get("region") or ""
-    if loc:
-        lines.append(f"Localisation: {loc}")
-    sec = ann.meta.get("sector") or ann.meta.get("secteur") or ""
-    if sec:
-        lines.append(f"Secteur: {sec}")
-    pr = ann.meta.get("price") or ann.meta.get("prix") or ""
-    if pr:
-        lines.append(f"Prix: {pr}")
-    lines.append(ann.url)
+def fetch_btk_listings(session: requests.Session, state: Dict[str, Any]) -> List[Announcement]:
+    # Try POST listings first (best quality). If it fails, fallback.
+    items = fetch_btk_listings_via_post(session)
+    if items is not None and len(items) > 0:
+        return items
+    return fetch_btk_listings_fallback(session, state)
+
+
+def format_btk_message(ann: Announcement) -> Optional[str]:
+    # placeholder; actual formatting uses enrichment inside runner via the enriched formatter below
+    # (we keep this for compatibility, but not used)
+    lines = [f"[Bedrijventekoop] {ann.title}", ann.url]
     return "\n".join(lines)
 
 
 # =============================================================================
-# Main
+# MAIN
 # =============================================================================
 _GLOBAL_SESSION = make_session()
 
 
 def main() -> None:
+    global STATE_DIRTY
+
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
 
     state = load_state()
     any_changed = False
 
-    sites = [
+    # 4 HTML sites
+    html_sites = [
         (COFIM_SITE, fetch_cofim, format_cofim, COFIM_MAX_PAGES),
         (CAR_SITE, fetch_car, format_car, CAR_MAX_PAGES),
-        (SITE3, fetch_we_transmission, format_we, WE_MAX_PAGES),
-        (SITE4, fetch_overnamemarkt, format_overnamemarkt, OVERNAMEMARKT_MAX_PAGES),
-        (SITE5, fetch_bedrijventekoop, format_bedrijventekoop, BEDRIJVENTEKOOP_MAX_PAGES),
-        (SITE6, fetch_cessionpro, format_cessionpro, CESSIONPRO_MAX_PAGES),
+        (OV_SITE, fetch_overnamemarkt, format_overnamemarkt, OVERNAMEMARKT_MAX_PAGES),
+        (C6_SITE, fetch_cessionpro, format_cessionpro, CESSIONPRO_MAX_PAGES),
     ]
 
-    for (site_name, fetch_fn, format_fn, max_pages) in sites:
+    for (site_name, fetch_fn, format_fn, max_pages) in html_sites:
         new_detected, sent, changed = run_site(
             session=_GLOBAL_SESSION,
             site_name=site_name,
@@ -1241,7 +1530,37 @@ def main() -> None:
         any_changed = any_changed or changed
         print(f"[{site_name}] new_detected={new_detected} sent={sent}")
 
-    if any_changed:
+    # WE Transmission (SPA) — direct
+    new_detected, sent, changed = run_site_direct(
+        session=_GLOBAL_SESSION,
+        site_name=WET_SITE,
+        fetch_items_fn=fetch_wet_listings,
+        format_fn=format_wet_message,
+        state=state,
+        bot_token=bot_token,
+        chat_id=chat_id,
+    )
+    any_changed = any_changed or changed
+    print(f"[{WET_SITE}] new_detected={new_detected} sent={sent}")
+
+    # Bedrijventekoop — direct fetch + detail enrichment at formatting time
+    # We wrap format so it enriches and also re-checks filters after enrichment.
+    def _btk_formatter(ann: Announcement) -> Optional[str]:
+        return format_bedrijventekoop_enriched(_GLOBAL_SESSION, ann)
+
+    new_detected, sent, changed = run_site_direct(
+        session=_GLOBAL_SESSION,
+        site_name=BTK_SITE,
+        fetch_items_fn=fetch_btk_listings,
+        format_fn=_btk_formatter,
+        state=state,
+        bot_token=bot_token,
+        chat_id=chat_id,
+    )
+    any_changed = any_changed or changed
+    print(f"[{BTK_SITE}] new_detected={new_detected} sent={sent}")
+
+    if any_changed or STATE_DIRTY:
         save_state(state)
 
 
