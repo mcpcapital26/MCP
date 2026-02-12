@@ -2,7 +2,7 @@ name: Acquisition Announcements Alerts
 
 on:
   schedule:
-    - cron: "0 * * * *"   # every hour (UTC)
+    - cron: "0 7 * * *"   # every hour (UTC)
   workflow_dispatch: {}
 
 permissions:
