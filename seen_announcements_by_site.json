@@ -171,9 +171,36 @@
     "cessionpro:snack-hypercentre-vise-equipe-a-remettre",
     "cessionpro:fonds-de-commerce-friterie-etablissement-renove-avec-terrasse"
   ],
-  "_meta": {
-    "bedrijventekoop": {
-      "last_id": 110329
-    }
-  }
+  "_meta": [
+    "bedrijventekoop"
+  ],
+  "we-transmission": [
+    "we-transmission:442",
+    "we-transmission:452",
+    "we-transmission:450",
+    "we-transmission:449",
+    "we-transmission:441",
+    "we-transmission:453",
+    "we-transmission:437",
+    "we-transmission:459",
+    "we-transmission:434",
+    "we-transmission:466",
+    "we-transmission:443",
+    "we-transmission:436",
+    "we-transmission:460",
+    "we-transmission:456",
+    "we-transmission:462",
+    "we-transmission:435",
+    "we-transmission:438",
+    "we-transmission:447",
+    "we-transmission:446",
+    "we-transmission:445",
+    "we-transmission:444",
+    "we-transmission:440",
+    "we-transmission:463",
+    "we-transmission:469",
+    "we-transmission:465",
+    "we-transmission:468",
+    "we-transmission:451"
+  ]
 }
