@@ -1,5 +1,5 @@
 # acquisitions_alerts.py
-# Scrapes 6 acquisition-listing sites and sends ONLY new listings via Telegram (state file per site).
+# Scrapes 7 acquisition-listing sites and sends ONLY new listings via Telegram (state file per site).
 #
 # Deps:
 #   pip install requests beautifulsoup4 lxml
@@ -50,7 +50,7 @@ FORBIDDEN_WORDS = [
 
 
 # ----------------------------
-# URLS (your 6 sources)
+# URLS (your 7 sources)
 # ----------------------------
 URL1_COFIM = "https://www.cofim.be/fr/entreprises/entreprises-fonds-de-commerce"
 URL2_CAR = "https://www.commerce-a-remettre.be/recherche?region=&sector=&id="
@@ -58,6 +58,7 @@ URL3_WE = "https://transmission.wallonie-entreprendre.be/"
 URL4_OVERNAMEMARKT = "https://www.overnamemarkt.be/fr/acheter?sectors=bouw,diensten,industrie,distributie,vrije-beroepen,andere"
 URL5_BEDRIJVENTEKOOP = "https://www.bedrijventekoop.be/te-koop-aangeboden?sectors=2,4,12,2_216,2_217,2_218,2_83,2_222,2_219,2_86,2_94,2_93,2_91,2_220,2_221,2_87,2_92,2_233,2_89,2_85,2_223,2_99,2_224,2_225,2_90,2_84,4_12,4_13,4_15,4_14,4_101,8_51,8_62,8_53,8_59,8_64,8_230,8_242,8_54,8_204,8_67,8_229,8_60,8_215,8_66,8_105,8_52,8_49,8_56,8_234,8_88,8_241,8_65,8_228,8_55,12_208,12_61,12_206,12_108,12_207,12_205&regions=26,27,28,29,30,31,32,33,34,35,36,37,38,39"
 URL6_CESSIONPRO = "https://www.cessionpro.be/?secteurs-v4oj=entreprise-de-construction-a-remettre-en-belgique%7Ce-commerce-a-vendre-en-belgique%7Csociete-industrielle-a-vendre-en-belgique%7Csociete-de-service-a-vendre-en-belgique"
+URL7_ACCESSIO = "https://accessio.be/dossiers-en-cours-2/"
 
 
 # ----------------------------
@@ -69,6 +70,7 @@ WE_MAX_PAGES = 3
 OVERNAMEMARKT_MAX_PAGES = 3
 BEDRIJVENTEKOOP_MAX_PAGES = 3
 CESSIONPRO_MAX_PAGES = 1
+ACCESSIO_MAX_PAGES = 1
 
 
 # ----------------------------
@@ -296,7 +298,6 @@ def run_site(
             items = fetch_fn(session, page)
             print(f"[{site_name}] page {page}: {len(items)} items (after parsing)")
             if page > 1 and not items:
-                # stop early if page is empty
                 break
             all_items.extend(items)
         except Exception as e:
@@ -318,7 +319,6 @@ def run_site(
 
     sent = 0
     for ann in new_items:
-        # filter (and mark seen) for all sites
         if forbidden_hit(ann):
             seen.add(ann.key)
             changed = True
@@ -384,7 +384,6 @@ def parse_cofim_listing(html: str) -> List[Announcement]:
         if not url:
             continue
 
-        # Filter sold
         flag = box.select_one("img.flag")
         flag_src = (flag.get("src", "") if flag else "").lower()
         if "banner-sold" in flag_src:
@@ -426,7 +425,6 @@ def parse_cofim_listing(html: str) -> List[Announcement]:
 
         out.append(Announcement(COFIM_SITE, title, url, meta))
 
-    # Dedup by URL
     uniq: Dict[str, Announcement] = {}
     for x in out:
         uniq[x.url] = x
@@ -462,7 +460,6 @@ CAR_BASE = "https://www.commerce-a-remettre.be"
 
 
 def build_car_page_url(page: int) -> str:
-    # Pagination is 0-based: page=0 is first
     p0 = max(0, page - 1)
     p = urlparse(URL2_CAR)
     q = dict(parse_qsl(p.query, keep_blank_values=True))
@@ -562,7 +559,7 @@ def format_car(ann: Announcement) -> str:
 
 
 # =============================================================================
-# SITE 3 — WE Transmission (API) — uses YOUR cURL exactly
+# SITE 3 — WE Transmission (API)
 # =============================================================================
 WE_SITE = "we-transmission"
 WE_BASE = "https://transmission.wallonie-entreprendre.be"
@@ -571,12 +568,6 @@ WE_CATALOGUE = f"{WE_BASE}/catalogue"
 
 
 def fetch_we(session: requests.Session, page: int) -> List[Announcement]:
-    """
-    Matches your provided cURL:
-      POST https://transmission.wallonie-entreprendre.be/backend/api/v1/company/visitor
-      body: {"page":1,"pageSize":"9","keyword":"","turnover":"","sector":[],"localisation":"","price":"","is_published":"1"}
-    """
-    # Make sure session has site cookies (not strictly required, but safe)
     try:
         session.get(WE_BASE + "/", headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
     except Exception:
@@ -623,24 +614,20 @@ def fetch_we(session: requests.Session, page: int) -> List[Announcement]:
         location_details = text_clean(str(it.get("location_details") or ""))
         created = text_clean(str(it.get("createdAt") or ""))
 
-        # sectors: list of {value: "..."}
         sectors = []
         for s in (it.get("sectors") or []):
             if isinstance(s, dict) and s.get("value"):
                 sectors.append(text_clean(str(s["value"])))
         sectors_str = ", ".join([x for x in sectors if x])
 
-        # price: transfer_details.price
         price = ""
         td = it.get("transfer_details") or it.get("transfer_detail_filter") or {}
         if isinstance(td, dict) and td.get("price"):
             price = text_clean(str(td.get("price")))
 
-        # turnover: take most recent year in turnovers list if present
         turnover = ""
         turnovers = it.get("turnovers") or it.get("turnover_filter") or []
         if isinstance(turnovers, list) and turnovers:
-            # pick first element (often newest), else best-effort
             t0 = turnovers[0]
             if isinstance(t0, dict) and t0.get("turnover"):
                 turnover = text_clean(str(t0.get("turnover")))
@@ -661,7 +648,6 @@ def fetch_we(session: requests.Session, page: int) -> List[Announcement]:
         if desc:
             meta["description"] = desc
 
-        # We do NOT guess a detail URL pattern. We provide catalogue + ID for retrieval.
         out.append(
             Announcement(
                 WE_SITE,
@@ -695,7 +681,7 @@ def format_we(ann: Announcement) -> str:
         if len(d) > 280:
             d = d[:280] + "…"
         lines.append(f"Résumé: {d}")
-    lines.append(ann.url)  # catalogue URL
+    lines.append(ann.url)
     return "\n".join(lines)
 
 
@@ -804,7 +790,7 @@ def format_overnamemarkt(ann: Announcement) -> str:
 
 
 # =============================================================================
-# SITE 5 — Bedrijventekoop (API POST) — uses YOUR cURL exactly
+# SITE 5 — Bedrijventekoop (API POST)
 # =============================================================================
 BTK_SITE = "bedrijventekoop"
 BTK_BASE = "https://www.bedrijventekoop.be"
@@ -820,12 +806,6 @@ def _btk_filters_from_url() -> Tuple[List[str], List[str]]:
 
 
 def _btk_extract_html_blob(resp: requests.Response) -> str:
-    """
-    listings-post may return:
-    - HTML fragment (text/html)
-    - JSON containing an HTML fragment somewhere
-    We handle both without guessing keys too aggressively.
-    """
     ct = (resp.headers.get("Content-Type") or "").lower()
     text = resp.text or ""
 
@@ -835,12 +815,10 @@ def _btk_extract_html_blob(resp: requests.Response) -> str:
         except Exception:
             return text
 
-        # Try common patterns: {html: "..."} or {data: "..."} etc
         if isinstance(j, dict):
-            for k, v in j.items():
+            for _, v in j.items():
                 if isinstance(v, str) and ("te-koop-aangeboden" in v or "for-sale" in v or "<a" in v):
                     return v
-            # sometimes nested
             for v in j.values():
                 if isinstance(v, dict):
                     for vv in v.values():
@@ -856,7 +834,6 @@ def parse_btk_fragment(html_fragment: str) -> List[Announcement]:
     soup = soupify(html_fragment)
     out: List[Announcement] = []
 
-    # Detail URLs typically include /te-koop-aangeboden/...
     for a in soup.select('a[href*="/te-koop-aangeboden/"], a[href*="/for-sale/"]'):
         href = (a.get("href") or "").strip()
         if not href:
@@ -866,9 +843,7 @@ def parse_btk_fragment(html_fragment: str) -> List[Announcement]:
 
         url = normalize_url(absolute_url(BTK_BASE, href))
 
-        # Title: try nearest headings, then link text
         title = ""
-        # climb a bit: parent card might contain h2/h3
         parent = a
         for _ in range(0, 4):
             if parent and parent.parent:
@@ -884,7 +859,6 @@ def parse_btk_fragment(html_fragment: str) -> List[Announcement]:
 
         out.append(Announcement(BTK_SITE, title, url, {}))
 
-    # Dedup by URL
     uniq: Dict[str, Announcement] = {}
     for x in out:
         uniq[x.url] = x
@@ -892,10 +866,6 @@ def parse_btk_fragment(html_fragment: str) -> List[Announcement]:
 
 
 def fetch_btk(session: requests.Session, page: int) -> List[Announcement]:
-    """
-    Matches your provided cURL to /listings-post (JSON body).
-    """
-    # prime cookies/session
     try:
         session.get(
             URL5_BEDRIJVENTEKOOP,
@@ -910,7 +880,7 @@ def fetch_btk(session: requests.Session, page: int) -> List[Announcement]:
     payload = {
         "type": 1,
         "sectors": sectors,
-        "regions": regions if regions else [],  # derived from your URL; set [] if you don't want region filtering
+        "regions": regions if regions else [],
         "turnovers": [],
         "askingprice": [],
         "typeofacquisition": [],
@@ -1067,6 +1037,177 @@ def format_cessionpro(ann: Announcement) -> str:
 
 
 # =============================================================================
+# SITE 7 — Accessio (HTML)
+# =============================================================================
+ACCESSIO_SITE = "accessio"
+ACCESSIO_BASE = "https://accessio.be"
+
+
+def _accessio_is_sold(text: str) -> bool:
+    t = norm_cmp(text)
+    return "entreprise vendue" in t or "vendue" in t
+
+
+def _accessio_clean_title(title: str) -> str:
+    title = text_clean(title)
+    title = re.sub(r"\s+", " ", title)
+    return title.strip(" -–—")
+
+
+def parse_accessio_listing(html: str) -> List[Announcement]:
+    soup = soupify(html)
+    out: List[Announcement] = []
+
+    for row in soup.select("div.row.dossiers_row"):
+        entry = row.select_one(".dossiers_bx .entry-content")
+        if not entry:
+            continue
+
+        full_text = text_clean(entry.get_text(" ", strip=True))
+        if not full_text:
+            continue
+
+        # Exclure les annonces vendues
+        if _accessio_is_sold(full_text):
+            continue
+
+        h2 = entry.select_one("h2")
+        h3 = entry.select_one("h3")
+
+        h2_text = text_clean(h2.get_text(" ", strip=True)) if h2 else ""
+        h3_text = text_clean(h3.get_text(" ", strip=True)) if h3 else ""
+
+        generic_h2 = norm_cmp(h2_text) in {
+            "entreprise a vendre",
+            "entreprises a vendre",
+        }
+
+        if h2_text and h3_text:
+            title = h3_text if generic_h2 else f"{h2_text} - {h3_text}"
+        else:
+            title = h2_text or h3_text
+
+        title = _accessio_clean_title(title)
+        if not title or len(title) < 3:
+            continue
+
+        meta: Dict[str, str] = {}
+        descriptive_lines = []
+
+        for el in entry.select("p, li"):
+            txt = text_clean(el.get_text(" ", strip=True))
+            if not txt:
+                continue
+
+            low = norm_cmp(txt)
+
+            if txt == h2_text or txt == h3_text:
+                continue
+
+            if "chiffre d'affaires" in low or "chiffre d affaire" in low or "ca moyen" in low:
+                meta["ca"] = txt
+                continue
+            if "ebitda" in low:
+                meta["ebitda"] = txt
+                continue
+            if "fonds propres" in low:
+                meta["fonds_propres"] = txt
+                continue
+            if "cash flow net" in low:
+                meta["cash_flow_net"] = txt
+                continue
+            if "effectif" in low:
+                meta["effectif"] = txt
+                continue
+            if "motif de la vente" in low:
+                meta["motif_vente"] = txt
+                continue
+            if "profil d'acquereur" in low or "profil d acquereur" in low:
+                meta["profil_acquereur"] = txt
+                continue
+            if "accompagnement" in low or "formation possible" in low:
+                meta["accompagnement"] = txt
+                continue
+            if "wallonie" in low or "belgique" in low or "hainaut" in low or "charleroi" in low:
+                if "location" not in meta:
+                    meta["location"] = txt
+
+            if low in {"chiffres", "donnees", "données", "quelques chiffres", "quelques chiffres (2021)"}:
+                continue
+
+            descriptive_lines.append(txt)
+
+        if descriptive_lines:
+            meta["teaser"] = " ".join(descriptive_lines[:3])
+
+        # Identification par contenu
+        content_fingerprint = hashlib.sha256(
+            norm_cmp(title + "||" + full_text).encode("utf-8")
+        ).hexdigest()
+
+        out.append(
+            Announcement(
+                site=ACCESSIO_SITE,
+                title=title,
+                url=URL7_ACCESSIO,
+                meta=meta,
+                uid=content_fingerprint,
+            )
+        )
+
+    uniq: Dict[str, Announcement] = {}
+    for x in out:
+        uniq[x.key] = x
+    return list(uniq.values())
+
+
+def fetch_accessio(session: requests.Session, page: int) -> List[Announcement]:
+    if page > 1:
+        return []
+
+    html = http_get(
+        session,
+        URL7_ACCESSIO,
+        extra_headers={
+            "Referer": "https://accessio.be/acquerir-une-entreprise/",
+            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+    )
+    return parse_accessio_listing(html)
+
+
+def format_accessio(ann: Announcement) -> str:
+    lines = [f"[Accessio] {ann.title}"]
+
+    if ann.meta.get("location"):
+        lines.append(f"Localisation: {ann.meta['location']}")
+    if ann.meta.get("ca"):
+        lines.append(f"CA: {ann.meta['ca']}")
+    if ann.meta.get("ebitda"):
+        lines.append(f"EBITDA: {ann.meta['ebitda']}")
+    if ann.meta.get("fonds_propres"):
+        lines.append(f"Fonds propres: {ann.meta['fonds_propres']}")
+    if ann.meta.get("cash_flow_net"):
+        lines.append(f"Cash flow net: {ann.meta['cash_flow_net']}")
+    if ann.meta.get("effectif"):
+        lines.append(f"Effectif: {ann.meta['effectif']}")
+    if ann.meta.get("motif_vente"):
+        lines.append(f"Motif: {ann.meta['motif_vente']}")
+    if ann.meta.get("profil_acquereur"):
+        lines.append(f"Profil recherché: {ann.meta['profil_acquereur']}")
+    if ann.meta.get("accompagnement"):
+        lines.append(f"Accompagnement: {ann.meta['accompagnement']}")
+    if ann.meta.get("teaser"):
+        teaser = ann.meta["teaser"]
+        if len(teaser) > 280:
+            teaser = teaser[:280] + "…"
+        lines.append(f"Résumé: {teaser}")
+
+    lines.append(ann.url)
+    return "\n".join(lines)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 def main() -> None:
@@ -1085,6 +1226,7 @@ def main() -> None:
         (OV_SITE, fetch_overnamemarkt, format_overnamemarkt, OVERNAMEMARKT_MAX_PAGES),
         (BTK_SITE, fetch_btk, format_btk, BEDRIJVENTEKOOP_MAX_PAGES),
         (C6_SITE, fetch_cessionpro, format_cessionpro, CESSIONPRO_MAX_PAGES),
+        (ACCESSIO_SITE, fetch_accessio, format_accessio, ACCESSIO_MAX_PAGES),
     ]
 
     for (site_name, fetch_fn, format_fn, max_pages) in sites:
