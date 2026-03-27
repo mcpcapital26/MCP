@@ -1,5 +1,5 @@
 # acquisitions_alerts.py
-# Scrapes 7 acquisition-listing sites and sends ONLY new listings via Telegram (state file per site).
+# Scrapes 8 acquisition-listing sites and sends ONLY new listings via Telegram (state file per site).
 #
 # Deps:
 #   pip install requests beautifulsoup4 lxml
@@ -50,7 +50,7 @@ FORBIDDEN_WORDS = [
 
 
 # ----------------------------
-# URLS (your 7 sources)
+# URLS (8 sources)
 # ----------------------------
 URL1_COFIM = "https://www.cofim.be/fr/entreprises/entreprises-fonds-de-commerce"
 URL2_CAR = "https://www.commerce-a-remettre.be/recherche?region=&sector=&id="
@@ -59,6 +59,7 @@ URL4_OVERNAMEMARKT = "https://www.overnamemarkt.be/fr/acheter?sectors=bouw,diens
 URL5_BEDRIJVENTEKOOP = "https://www.bedrijventekoop.be/te-koop-aangeboden?sectors=2,4,12,2_216,2_217,2_218,2_83,2_222,2_219,2_86,2_94,2_93,2_91,2_220,2_221,2_87,2_92,2_233,2_89,2_85,2_223,2_99,2_224,2_225,2_90,2_84,4_12,4_13,4_15,4_14,4_101,8_51,8_62,8_53,8_59,8_64,8_230,8_242,8_54,8_204,8_67,8_229,8_60,8_215,8_66,8_105,8_52,8_49,8_56,8_234,8_88,8_241,8_65,8_228,8_55,12_208,12_61,12_206,12_108,12_207,12_205&regions=26,27,28,29,30,31,32,33,34,35,36,37,38,39"
 URL6_CESSIONPRO = "https://www.cessionpro.be/?secteurs-v4oj=entreprise-de-construction-a-remettre-en-belgique%7Ce-commerce-a-vendre-en-belgique%7Csociete-industrielle-a-vendre-en-belgique%7Csociete-de-service-a-vendre-en-belgique"
 URL7_ACCESSIO = "https://accessio.be/dossiers-en-cours-2/"
+URL8_ADCORPORATE = "https://www.bedrijventekoop.be/iframe/adcorporate?type=1&limit=50"
 
 
 # ----------------------------
@@ -71,6 +72,7 @@ OVERNAMEMARKT_MAX_PAGES = 3
 BEDRIJVENTEKOOP_MAX_PAGES = 3
 CESSIONPRO_MAX_PAGES = 1
 ACCESSIO_MAX_PAGES = 1
+ADCORPORATE_MAX_PAGES = 1
 
 
 # ----------------------------
@@ -304,7 +306,6 @@ def run_site(
             print(f"[{site_name}] fetch/parse error page={page}: {e}")
         time.sleep(SLEEP_BETWEEN_PAGES_SEC)
 
-    # Dedup by key
     uniq_by_key: Dict[str, Announcement] = {}
     for it in all_items:
         uniq_by_key[it.key] = it
@@ -1067,7 +1068,6 @@ def parse_accessio_listing(html: str) -> List[Announcement]:
         if not full_text:
             continue
 
-        # Exclure les annonces vendues
         if _accessio_is_sold(full_text):
             continue
 
@@ -1140,7 +1140,6 @@ def parse_accessio_listing(html: str) -> List[Announcement]:
         if descriptive_lines:
             meta["teaser"] = " ".join(descriptive_lines[:3])
 
-        # Identification par contenu
         content_fingerprint = hashlib.sha256(
             norm_cmp(title + "||" + full_text).encode("utf-8")
         ).hexdigest()
@@ -1208,6 +1207,159 @@ def format_accessio(ann: Announcement) -> str:
 
 
 # =============================================================================
+# SITE 8 — Adcorporate iframe (HTML)
+# =============================================================================
+ADCORP_SITE = "adcorporate"
+ADCORP_BASE = "https://www.bedrijventekoop.be"
+
+
+def _extract_adcorp_description(item_html: str) -> str:
+    """
+    The HTML is malformed (<a class='description'> wraps blocks without clean closing tags),
+    so we extract the description from raw HTML between:
+      <a ... class="description"> ... <div class="clearfix options"></div>
+    """
+    m = re.search(
+        r'<a[^>]*class="description"[^>]*>(.*?)<div class="clearfix options"></div>',
+        item_html,
+        flags=re.I | re.S,
+    )
+    if not m:
+        return ""
+
+    snippet = m.group(1)
+    snippet_soup = BeautifulSoup(snippet, "lxml")
+    txt = text_clean(snippet_soup.get_text(" ", strip=True))
+    txt = re.sub(r"\bMeer informatie\s*>>>\s*$", "", txt, flags=re.I).strip()
+    return txt
+
+
+def parse_adcorporate_listing(html: str) -> List[Announcement]:
+    soup = soupify(html)
+    out: List[Announcement] = []
+
+    for item in soup.select("div.search-result-item"):
+        title_a = item.select_one(".business-title a.description-name[href]")
+        if not title_a:
+            continue
+
+        href = title_a.get("href", "").strip()
+        url = normalize_url(absolute_url(ADCORP_BASE, href))
+        title = text_clean(title_a.get_text(" ", strip=True))
+        if not title or len(title) < 3:
+            continue
+
+        price = ""
+        price_a = item.select_one(".business-ask-price a[href]")
+        if price_a:
+            price = text_clean(price_a.get_text(" ", strip=True))
+
+        location = ""
+        loc_a = item.select_one("p.fl a.preset-region[href]")
+        if loc_a:
+            location = text_clean(loc_a.get_text(" ", strip=True))
+
+        purpose = ""
+        purpose_a = item.select_one("p.fr a.preset-purpose-sector[href]")
+        if purpose_a:
+            purpose = text_clean(purpose_a.get_text(" ", strip=True))
+
+        if norm_cmp(purpose) != "te koop aangeboden":
+            continue
+
+        item_html = str(item)
+        description = _extract_adcorp_description(item_html)
+
+        date_text = ""
+        date_span = item.select_one(".order-date .date")
+        if date_span:
+            date_text = text_clean(date_span.get_text(" ", strip=True))
+
+        ref_text = ""
+        ref_links = item.select(".order-date .date a[href]")
+        if ref_links:
+            ref_text = text_clean(ref_links[-1].get_text(" ", strip=True))
+
+        uid = ""
+        if ref_text.startswith("#"):
+            uid = ref_text[1:].strip()
+
+        if not uid:
+            m = re.search(r"/show/(\d+)", href)
+            if m:
+                uid = m.group(1)
+
+        meta: Dict[str, str] = {}
+        if price:
+            meta["price"] = price
+        if location:
+            meta["location"] = location
+        if purpose:
+            meta["type"] = purpose
+        if description:
+            meta["description"] = description
+            meta["teaser"] = description
+        if date_text:
+            meta["date"] = date_text
+        if ref_text:
+            meta["reference"] = ref_text
+
+        out.append(
+            Announcement(
+                site=ADCORP_SITE,
+                title=title,
+                url=url,
+                meta=meta,
+                uid=uid or None,
+            )
+        )
+
+    uniq: Dict[str, Announcement] = {}
+    for x in out:
+        uniq[x.key] = x
+    return list(uniq.values())
+
+
+def fetch_adcorporate(session: requests.Session, page: int) -> List[Announcement]:
+    if page > 1:
+        return []
+
+    html = http_get(
+        session,
+        URL8_ADCORPORATE,
+        extra_headers={
+            "Referer": "https://www.adcorporate.be/",
+            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+    )
+    return parse_adcorporate_listing(html)
+
+
+def format_adcorporate(ann: Announcement) -> str:
+    lines = [f"[Adcorporate] {ann.title}"]
+
+    if ann.meta.get("reference"):
+        lines.append(f"Réf: {ann.meta['reference']}")
+    elif ann.uid:
+        lines.append(f"ID: #{ann.uid}")
+
+    if ann.meta.get("location"):
+        lines.append(f"Localisation: {ann.meta['location']}")
+    if ann.meta.get("price"):
+        lines.append(f"Prix: {ann.meta['price']}")
+    if ann.meta.get("date"):
+        lines.append(f"Date: {ann.meta['date']}")
+    if ann.meta.get("description"):
+        d = ann.meta["description"]
+        if len(d) > 280:
+            d = d[:280] + "…"
+        lines.append(f"Résumé: {d}")
+
+    lines.append(ann.url)
+    return "\n".join(lines)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 def main() -> None:
@@ -1227,6 +1379,7 @@ def main() -> None:
         (BTK_SITE, fetch_btk, format_btk, BEDRIJVENTEKOOP_MAX_PAGES),
         (C6_SITE, fetch_cessionpro, format_cessionpro, CESSIONPRO_MAX_PAGES),
         (ACCESSIO_SITE, fetch_accessio, format_accessio, ACCESSIO_MAX_PAGES),
+        (ADCORP_SITE, fetch_adcorporate, format_adcorporate, ADCORPORATE_MAX_PAGES),
     ]
 
     for (site_name, fetch_fn, format_fn, max_pages) in sites:
@@ -1249,3 +1402,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+```numerusform출장샵 to=container.execាហ្គjson  天天爱彩票提现json хадоуjson ＿影音先锋 开号地址json  ฝ่ายขายละครjson  日本一本道 񎔈json ҭакjson content_hash=
